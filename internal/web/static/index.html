@@ -88,6 +88,13 @@
         <div class="section-block">
           <h2>Server Settings</h2>
           <div class="setting-row">
+            <label>Server Name</label>
+            <div class="name-edit-row">
+              <input type="text" id="server-name-input" class="input-inline" placeholder="Server name">
+              <button class="btn btn-sm" id="save-server-name">Save</button>
+            </div>
+          </div>
+          <div class="setting-row">
             <label for="max-ships">Max Ships <span id="max-ships-val">100</span></label>
             <input type="range" id="max-ships" min="10" max="200" value="100">
           </div>
@@ -99,6 +106,7 @@
             <label>Saved Games Path</label>
             <div class="path-row">
               <span class="path-value" id="saved-games-path">--</span>
+              <button class="btn btn-sm" id="browse-path-btn">Browse</button>
               <button class="btn btn-sm" id="deploy-hook-btn">Deploy Hook</button>
             </div>
           </div>
@@ -186,7 +194,10 @@
       </div>
       <div class="modal-field">
         <label for="new-server-path">Saved Games Path</label>
-        <input type="text" id="new-server-path" placeholder="C:\Users\...\Saved Games\DCS.server">
+        <div class="input-browse-row">
+          <input type="text" id="new-server-path" placeholder="C:\Users\...\Saved Games\DCS.server">
+          <button class="btn btn-sm" id="modal-browse" type="button">Browse</button>
+        </div>
       </div>
       <div class="modal-actions">
         <button class="btn" id="modal-cancel">Cancel</button>

@@ -29,6 +29,9 @@
   var deployHookBtn = document.getElementById("deploy-hook-btn");
   var hookDeployStatus = document.getElementById("hook-deploy-status");
   var removeServerBtn = document.getElementById("remove-server-btn");
+  var serverNameInput = document.getElementById("server-name-input");
+  var saveServerNameBtn = document.getElementById("save-server-name");
+  var browsePathBtn = document.getElementById("browse-path-btn");
 
   // Modal refs
   var addServerModal = document.getElementById("add-server-modal");
@@ -37,6 +40,7 @@
   var modalCancel = document.getElementById("modal-cancel");
   var modalAdd = document.getElementById("modal-add");
   var modalError = document.getElementById("modal-error");
+  var modalBrowse = document.getElementById("modal-browse");
 
   var ignoreNextToggle = false;
   var currentServerId = null;
@@ -234,6 +238,11 @@
         shipCount.textContent = data.shipCount;
         spawnedCount.textContent = data.spawnedCount;
         pendingCount.textContent = data.pendingCount;
+
+        // Only update name input if the user isn't actively editing it.
+        if (document.activeElement !== serverNameInput) {
+          serverNameInput.value = data.name || "";
+        }
 
         maxShipsSlider.value = data.maxShips;
         maxShipsVal.textContent = data.maxShips;
@@ -459,6 +468,54 @@
         deployHookBtn.disabled = false;
         deployHookBtn.textContent = "Deploy Hook";
       });
+  });
+
+  // ------ Event handlers: rename server ------
+  saveServerNameBtn.addEventListener("click", function () {
+    if (!currentServerId) return;
+    var name = serverNameInput.value.trim();
+    if (!name) return;
+
+    fetch("/api/servers/" + currentServerId, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name })
+    }).then(function () {
+      fetchServers();
+    });
+  });
+
+  serverNameInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") saveServerNameBtn.click();
+  });
+
+  // ------ Event handlers: browse saved games path ------
+  function browseFolder(callback) {
+    fetch("/api/browse-folder", { method: "POST" })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.path) callback(data.path);
+      })
+      .catch(function () {});
+  }
+
+  browsePathBtn.addEventListener("click", function () {
+    if (!currentServerId) return;
+    browseFolder(function (path) {
+      fetch("/api/servers/" + currentServerId, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ savedGamesPath: path })
+      }).then(function () {
+        fetchServerStatus();
+      });
+    });
+  });
+
+  modalBrowse.addEventListener("click", function () {
+    browseFolder(function (path) {
+      newServerPath.value = path;
+    });
   });
 
   // ------ Event handlers: remove server ------

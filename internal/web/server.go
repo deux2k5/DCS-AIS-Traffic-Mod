@@ -7,6 +7,9 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os/exec"
+	"runtime"
+	"strings"
 
 	"github.com/deux2k5/dcs-ais-traffic/internal/config"
 	"github.com/deux2k5/dcs-ais-traffic/internal/servermgr"
@@ -100,6 +103,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /api/status", s.handleGlobalStatus)
 	mux.HandleFunc("GET /api/config", s.handleConfigGet)
 	mux.HandleFunc("POST /api/config", s.handleConfigPost)
+	mux.HandleFunc("POST /api/browse-folder", s.handleBrowseFolder)
 	mux.HandleFunc("GET /api/update/check", s.handleUpdateCheck)
 	mux.HandleFunc("POST /api/update/apply", s.handleUpdateApply)
 
@@ -182,6 +186,30 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, snap)
 }
 
+func (s *Server) handleBrowseFolder(w http.ResponseWriter, r *http.Request) {
+	if runtime.GOOS != "windows" {
+		http.Error(w, "folder browser only supported on Windows", http.StatusBadRequest)
+		return
+	}
+
+	// Use PowerShell's folder browser dialog.
+	script := `Add-Type -AssemblyName System.Windows.Forms
+$f = New-Object System.Windows.Forms.FolderBrowserDialog
+$f.Description = "Select DCS Saved Games folder"
+$f.ShowNewFolderButton = $false
+if ($f.ShowDialog() -eq "OK") { $f.SelectedPath } else { "" }`
+
+	cmd := exec.Command("powershell", "-NoProfile", "-Command", script)
+	out, err := cmd.Output()
+	if err != nil {
+		http.Error(w, "folder dialog failed", http.StatusInternalServerError)
+		return
+	}
+
+	path := strings.TrimSpace(string(out))
+	writeJSON(w, map[string]string{"path": path})
+}
+
 // --------------------------------------------------------------------------
 // Server CRUD
 // --------------------------------------------------------------------------
@@ -258,6 +286,8 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pathChanged := patch.SavedGamesPath != ""
+
 	s.cfg.Lock()
 	err := s.cfg.UpdateServer(id, patch)
 	s.cfg.Unlock()
@@ -265,6 +295,10 @@ func (s *Server) handleUpdateServer(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
+	}
+
+	if pathChanged {
+		s.mgr.RefreshHookStatus(id)
 	}
 
 	writeJSON(w, map[string]string{"status": "updated"})

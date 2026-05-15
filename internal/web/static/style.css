@@ -759,6 +759,38 @@ tbody tr:hover { background: var(--table-row-hover); }
 .btn-sm {
   padding: 4px 10px;
   font-size: 11px;
+  white-space: nowrap;
+}
+
+/* ===== Name edit row ===== */
+.name-edit-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.input-inline {
+  flex: 1;
+  padding: 5px 8px;
+  font-size: 13px;
+  font-family: var(--font);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+.input-inline:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* ===== Browse row in modal ===== */
+.input-browse-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.input-browse-row input {
+  flex: 1;
 }
 
 /* ===== Danger button ===== */

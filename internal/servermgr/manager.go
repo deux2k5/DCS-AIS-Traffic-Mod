@@ -104,6 +104,31 @@ func (m *Manager) Instance(id string) *ServerInstance {
 	return m.instances[id]
 }
 
+// RefreshHookStatus rechecks the cached hook deploy status for a server.
+// Call after changing the saved games path.
+func (m *Manager) RefreshHookStatus(id string) {
+	m.cfg.RLock()
+	srv := m.cfg.ServerByID(id)
+	var path string
+	var port int
+	if srv != nil {
+		path = srv.SavedGamesPath
+		port = srv.HookPort
+	}
+	m.cfg.RUnlock()
+
+	var deployed bool
+	if path != "" {
+		deployed, _ = hookdeploy.IsDeployed(path, port)
+	}
+
+	m.mu.RLock()
+	if inst, ok := m.instances[id]; ok {
+		inst.HookDeployed = deployed
+	}
+	m.mu.RUnlock()
+}
+
 // Instances returns a snapshot of all server instances.
 func (m *Manager) Instances() []*ServerInstance {
 	m.mu.RLock()

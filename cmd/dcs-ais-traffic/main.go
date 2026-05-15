@@ -2,10 +2,8 @@ package main
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -15,8 +13,7 @@ import (
 	"syscall"
 
 	"github.com/deux2k5/dcs-ais-traffic/internal/config"
-	"github.com/deux2k5/dcs-ais-traffic/internal/coordinator"
-	"github.com/deux2k5/dcs-ais-traffic/internal/dcscomm"
+	"github.com/deux2k5/dcs-ais-traffic/internal/servermgr"
 	"github.com/deux2k5/dcs-ais-traffic/internal/shipcache"
 	"github.com/deux2k5/dcs-ais-traffic/internal/web"
 )
@@ -29,58 +26,38 @@ func main() {
 	_, statErr := os.Stat("config.toml")
 	firstBoot := os.IsNotExist(statErr)
 
-	// Load config.
+	// Load config (with auto-migration from v1 format).
 	cfg, err := config.Load("config.toml")
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
 
-	// Always start with AIS disabled — user must enable via dashboard.
-	cfg.Lock()
-	cfg.AIS.Enabled = false
-	cfg.Unlock()
-
-	log.Println("config loaded")
+	log.Printf("config loaded: %d server(s) configured", len(cfg.Servers))
 
 	// On first boot, offer to create a desktop shortcut.
 	if firstBoot && runtime.GOOS == "windows" {
 		offerDesktopShortcut()
 	}
 
-	// Create ship metadata cache, coordinator and DCS comm server.
+	// Create shared ship metadata cache.
 	cache := shipcache.New("shipcache.json")
 	log.Printf("ship cache: %d vessels loaded", cache.Size())
 
-	cfg.RLock()
-	hookPort := cfg.DCS.HookPort
-	cfg.RUnlock()
+	// Create the server manager (owns AIS client + all server instances).
+	mgr := servermgr.New(cfg, cache)
 
-	// Use a closure to break the circular dependency: the DCS server needs the
-	// coordinator's handler, and the coordinator needs the DCS server. The
-	// closure captures the coord pointer which is set before any connections
-	// arrive.
-	var coord *coordinator.Coordinator
-	dcsServer := dcscomm.NewServer(hookPort, func(msg dcscomm.InboundMessage) {
-		coord.OnHookMessage(msg)
-	})
-	coord = coordinator.New(cfg, dcsServer, cache)
+	// Deploy hooks to all configured servers on startup (keeps Lua in sync
+	// with binary version after self-update).
+	mgr.DeployAllHooks()
 
-	// Start TCP server for DCS hook.
-	go func() {
-		if err := dcsServer.Start(); err != nil {
-			// Listener close during shutdown is expected — don't treat it as fatal.
-			var opErr *net.OpError
-			if errors.As(err, &opErr) && opErr.Op == "accept" {
-				log.Println("[DCS] TCP server stopped")
-				return
-			}
-			log.Printf("[DCS] TCP server error: %v", err)
-			os.Exit(1)
-		}
-	}()
+	// Start all configured server instances (TCP listeners + coordinators).
+	mgr.StartAll()
+
+	// Initial AIS subscription based on whatever theatres are already known.
+	mgr.RefreshAIS()
 
 	// Start web server.
-	webServer := web.NewServer(cfg, coord, dcsServer)
+	webServer := web.NewServer(cfg, mgr)
 	go func() {
 		if err := webServer.Start(); err != nil {
 			log.Printf("[WEB] server error: %v", err)
@@ -88,14 +65,12 @@ func main() {
 		}
 	}()
 
-	// Start coordinator loop.
-	go coord.Start()
-
 	cfg.RLock()
 	webPort := cfg.Web.Port
+	serverCount := len(cfg.Servers)
 	cfg.RUnlock()
 
-	log.Printf("DCS AIS Traffic running (web: http://localhost:%d, hook: :%d)", webPort, hookPort)
+	log.Printf("DCS AIS Traffic running (web: http://localhost:%d, %d server(s))", webPort, serverCount)
 
 	// Wait for shutdown signal.
 	sigCh := make(chan os.Signal, 1)
@@ -103,8 +78,8 @@ func main() {
 	<-sigCh
 
 	log.Println("shutting down...")
-	coord.Stop()
-	dcsServer.Stop()
+	mgr.StopAll()
+	cache.Stop()
 }
 
 // offerDesktopShortcut prompts the user (if running interactively) to create

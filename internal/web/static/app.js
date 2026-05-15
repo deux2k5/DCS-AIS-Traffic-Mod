@@ -1,6 +1,7 @@
 (function () {
   "use strict";
 
+  // ------ DOM refs ------
   var aisDot = document.getElementById("ais-dot");
   var hookDot = document.getElementById("hook-dot");
   var enableToggle = document.getElementById("enable-toggle");
@@ -20,12 +21,30 @@
   var shipTbody = document.getElementById("ship-tbody");
   var emptyState = document.getElementById("empty-state");
   var shipTable = document.getElementById("ship-table");
+  var serverSelect = document.getElementById("server-select");
+  var addServerBtn = document.getElementById("add-server-btn");
+  var serverPanel = document.getElementById("server-panel");
+  var welcomeState = document.getElementById("welcome-state");
+  var savedGamesPath = document.getElementById("saved-games-path");
+  var deployHookBtn = document.getElementById("deploy-hook-btn");
+  var hookDeployStatus = document.getElementById("hook-deploy-status");
+  var removeServerBtn = document.getElementById("remove-server-btn");
+
+  // Modal refs
+  var addServerModal = document.getElementById("add-server-modal");
+  var newServerName = document.getElementById("new-server-name");
+  var newServerPath = document.getElementById("new-server-path");
+  var modalCancel = document.getElementById("modal-cancel");
+  var modalAdd = document.getElementById("modal-add");
+  var modalError = document.getElementById("modal-error");
 
   var ignoreNextToggle = false;
+  var currentServerId = null;
+  var serverList = [];
 
   // ------ Sort state ------
-  var sortCol = "state";   // default sort column
-  var sortAsc = true;      // ascending by default
+  var sortCol = "state";
+  var sortAsc = true;
 
   var SORT_COLUMNS = ["name", "category", "dcsModel", "length", "pos", "heading", "sog", "seen", "state"];
 
@@ -68,7 +87,6 @@
     for (var i = 0; i < headers.length; i++) {
       var th = headers[i];
       var col = th.getAttribute("data-sort");
-      // Remove old indicator
       var old = th.querySelector(".sort-arrow");
       if (old) old.remove();
 
@@ -125,7 +143,6 @@
           va = stateOrder[a.state] !== undefined ? stateOrder[a.state] : 3;
           vb = stateOrder[b.state] !== undefined ? stateOrder[b.state] : 3;
           if (va !== vb) return asc ? va - vb : vb - va;
-          // secondary: SOG descending
           return b.sog - a.sog;
         default:
           return 0;
@@ -135,12 +152,75 @@
     return ships;
   }
 
-  // ------ Status polling ------
-  function fetchStatus() {
-    fetch("/api/status")
+  // ------ Server list (includes global AIS status to reduce poll requests) ------
+  function fetchServers() {
+    fetch("/api/servers")
       .then(function (r) { return r.json(); })
       .then(function (data) {
+        // Update global AIS indicator from combined response.
         aisDot.className = data.aisConnected ? "dot connected" : "dot";
+
+        var servers = data.servers || [];
+        serverList = servers;
+        renderServerSelect();
+
+        if (servers.length === 0) {
+          welcomeState.style.display = "block";
+          serverPanel.style.display = "none";
+          currentServerId = null;
+          clearShipTable();
+          return;
+        }
+
+        welcomeState.style.display = "none";
+
+        // If current server was removed, pick the first one.
+        var found = false;
+        for (var i = 0; i < servers.length; i++) {
+          if (servers[i].id === currentServerId) { found = true; break; }
+        }
+        if (!found) {
+          currentServerId = servers[0].id;
+          serverSelect.value = currentServerId;
+        }
+
+        serverPanel.style.display = "block";
+      })
+      .catch(function () {});
+  }
+
+  function renderServerSelect() {
+    var val = serverSelect.value;
+    serverSelect.innerHTML = "";
+    for (var i = 0; i < serverList.length; i++) {
+      var s = serverList[i];
+      var opt = document.createElement("option");
+      opt.value = s.id;
+      var suffix = s.hookConnected ? " •" : "";
+      opt.textContent = s.name + suffix;
+      serverSelect.appendChild(opt);
+    }
+    if (val && serverSelect.querySelector('option[value="' + val + '"]')) {
+      serverSelect.value = val;
+    }
+  }
+
+  serverSelect.addEventListener("change", function () {
+    currentServerId = serverSelect.value;
+    fetchServerStatus();
+    fetchShips();
+  });
+
+  // Global AIS status is now included in fetchServers() response to reduce
+  // poll requests from 4 to 2 per cycle.
+
+  // ------ Per-server status ------
+  function fetchServerStatus() {
+    if (!currentServerId) return;
+
+    fetch("/api/servers/" + currentServerId + "/status")
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
         hookDot.className = data.hookConnected ? "dot connected" : "dot";
 
         ignoreNextToggle = true;
@@ -154,6 +234,36 @@
         shipCount.textContent = data.shipCount;
         spawnedCount.textContent = data.spawnedCount;
         pendingCount.textContent = data.pendingCount;
+
+        maxShipsSlider.value = data.maxShips;
+        maxShipsVal.textContent = data.maxShips;
+        updateIntervalSlider.value = data.updateSeconds;
+        updateIntervalVal.textContent = data.updateSeconds;
+
+        savedGamesPath.textContent = data.savedGamesPath || "Not set";
+        savedGamesPath.title = data.savedGamesPath || "";
+
+        if (data.hookDeployed) {
+          hookDeployStatus.textContent = "Deployed";
+          hookDeployStatus.className = "hook-deploy-status deployed";
+        } else if (data.savedGamesPath) {
+          hookDeployStatus.textContent = "Not deployed";
+          hookDeployStatus.className = "hook-deploy-status";
+        } else {
+          hookDeployStatus.textContent = "";
+          hookDeployStatus.className = "hook-deploy-status";
+        }
+
+        // Update filter checkboxes.
+        var filters = data.filters;
+        if (filters) {
+          document.querySelectorAll("[data-filter]").forEach(function (el) {
+            var key = el.getAttribute("data-filter");
+            if (filters.hasOwnProperty(key)) {
+              el.checked = filters[key];
+            }
+          });
+        }
 
         renderCategoryBar(data.categories || {}, data.shipCount || 0);
       })
@@ -176,7 +286,7 @@
       var color = CATEGORY_COLORS[key] || "#6f8796";
       html += '<div class="cat-seg" style="width:' + pct + '%;background:' + color + '" title="' + key + ': ' + count + '"></div>';
     }
-    html += "</div><div class=\"cat-legend\">";
+    html += '</div><div class="cat-legend">';
     for (var j = 0; j < order.length; j++) {
       var k = order[j];
       var c = cats[k] || 0;
@@ -187,14 +297,18 @@
     categoryBar.innerHTML = html;
   }
 
-  // ------ Ships polling ------
+  // ------ Ships ------
   function fetchShips() {
-    fetch("/api/ships")
+    if (!currentServerId) {
+      clearShipTable();
+      return;
+    }
+
+    fetch("/api/servers/" + currentServerId + "/ships")
       .then(function (r) { return r.json(); })
       .then(function (ships) {
         if (!ships || ships.length === 0) {
-          shipTable.style.display = "none";
-          emptyState.className = "empty-state visible";
+          clearShipTable();
           return;
         }
 
@@ -231,6 +345,12 @@
       .catch(function () {});
   }
 
+  function clearShipTable() {
+    shipTable.style.display = "none";
+    emptyState.className = "empty-state visible";
+    shipTbody.innerHTML = "";
+  }
+
   function formatAge(isoStr, nowMs) {
     if (!isoStr) return "--";
     var then = new Date(isoStr).getTime();
@@ -241,41 +361,21 @@
     return Math.floor(diff / 3600) + "h";
   }
 
-  // ------ Config loading ------
-  function loadConfig() {
-    fetch("/api/config")
-      .then(function (r) { return r.json(); })
-      .then(function (cfg) {
-        maxShipsSlider.value = cfg.ais.maxShips;
-        maxShipsVal.textContent = cfg.ais.maxShips;
-        updateIntervalSlider.value = cfg.ais.updateSeconds;
-        updateIntervalVal.textContent = cfg.ais.updateSeconds;
-
-        var filters = cfg.filters;
-        document.querySelectorAll("[data-filter]").forEach(function (el) {
-          var key = el.getAttribute("data-filter");
-          if (filters.hasOwnProperty(key)) {
-            el.checked = filters[key];
-          }
-        });
-      })
-      .catch(function () {});
-  }
-
-  // ------ Event handlers ------
+  // ------ Event handlers: toggle ------
   enableToggle.addEventListener("change", function () {
-    if (ignoreNextToggle) return;
+    if (ignoreNextToggle || !currentServerId) return;
     var enabled = enableToggle.checked;
     toggleText.textContent = enabled ? "Enabled" : "Disabled";
     toggleText.className = enabled ? "toggle-text active" : "toggle-text";
 
-    fetch("/api/toggle", {
+    fetch("/api/servers/" + currentServerId + "/toggle", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled: enabled })
     });
   });
 
+  // ------ Event handlers: API key ------
   saveApiKeyBtn.addEventListener("click", function () {
     var key = apiKeyInput.value.trim();
     if (!key) return;
@@ -293,14 +393,16 @@
     });
   });
 
+  // ------ Event handlers: per-server settings ------
   maxShipsSlider.addEventListener("input", function () {
     maxShipsVal.textContent = maxShipsSlider.value;
   });
   maxShipsSlider.addEventListener("change", function () {
-    fetch("/api/config", {
-      method: "POST",
+    if (!currentServerId) return;
+    fetch("/api/servers/" + currentServerId, {
+      method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ais: { maxShips: parseInt(maxShipsSlider.value, 10) } })
+      body: JSON.stringify({ maxShips: parseInt(maxShipsSlider.value, 10) })
     });
   });
 
@@ -308,20 +410,23 @@
     updateIntervalVal.textContent = updateIntervalSlider.value;
   });
   updateIntervalSlider.addEventListener("change", function () {
-    fetch("/api/config", {
-      method: "POST",
+    if (!currentServerId) return;
+    fetch("/api/servers/" + currentServerId, {
+      method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ais: { updateSeconds: parseInt(updateIntervalSlider.value, 10) } })
+      body: JSON.stringify({ updateSeconds: parseInt(updateIntervalSlider.value, 10) })
     });
   });
 
+  // ------ Event handlers: filters ------
   document.querySelectorAll("[data-filter]").forEach(function (el) {
     el.addEventListener("change", function () {
+      if (!currentServerId) return;
       var filters = {};
       document.querySelectorAll("[data-filter]").forEach(function (cb) {
         filters[cb.getAttribute("data-filter")] = cb.checked;
       });
-      fetch("/api/filters", {
+      fetch("/api/servers/" + currentServerId + "/filters", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(filters)
@@ -329,13 +434,98 @@
     });
   });
 
-  function escapeHTML(str) {
-    if (!str) return "";
-    return str.replace(/&/g, "&amp;")
-              .replace(/</g, "&lt;")
-              .replace(/>/g, "&gt;")
-              .replace(/"/g, "&quot;");
-  }
+  // ------ Event handlers: deploy hook ------
+  deployHookBtn.addEventListener("click", function () {
+    if (!currentServerId) return;
+    deployHookBtn.disabled = true;
+    deployHookBtn.textContent = "Deploying...";
+
+    fetch("/api/servers/" + currentServerId + "/deploy", { method: "POST" })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.error) {
+          hookDeployStatus.textContent = "Error: " + data.error;
+          hookDeployStatus.className = "hook-deploy-status";
+        } else {
+          hookDeployStatus.textContent = "Deployed";
+          hookDeployStatus.className = "hook-deploy-status deployed";
+        }
+      })
+      .catch(function () {
+        hookDeployStatus.textContent = "Deploy failed";
+        hookDeployStatus.className = "hook-deploy-status";
+      })
+      .finally(function () {
+        deployHookBtn.disabled = false;
+        deployHookBtn.textContent = "Deploy Hook";
+      });
+  });
+
+  // ------ Event handlers: remove server ------
+  removeServerBtn.addEventListener("click", function () {
+    if (!currentServerId) return;
+    var name = serverSelect.options[serverSelect.selectedIndex].textContent;
+    if (!confirm("Remove server \"" + name.replace(/ •$/, "") + "\"? This will stop tracking and remove the hook file.")) return;
+
+    fetch("/api/servers/" + currentServerId, { method: "DELETE" })
+      .then(function () {
+        currentServerId = null;
+        fetchServers();
+      });
+  });
+
+  // ------ Modal: add server ------
+  addServerBtn.addEventListener("click", function () {
+    addServerModal.style.display = "flex";
+    newServerName.value = "";
+    newServerPath.value = "";
+    modalError.textContent = "";
+    newServerName.focus();
+  });
+
+  modalCancel.addEventListener("click", function () {
+    addServerModal.style.display = "none";
+  });
+
+  addServerModal.addEventListener("click", function (e) {
+    if (e.target === addServerModal) addServerModal.style.display = "none";
+  });
+
+  modalAdd.addEventListener("click", function () {
+    var name = newServerName.value.trim();
+    var path = newServerPath.value.trim();
+
+    if (!name) {
+      modalError.textContent = "Server name is required.";
+      return;
+    }
+
+    modalAdd.disabled = true;
+    modalAdd.textContent = "Adding...";
+    modalError.textContent = "";
+
+    fetch("/api/servers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name, savedGamesPath: path })
+    })
+      .then(function (r) {
+        if (!r.ok) return r.text().then(function (t) { throw new Error(t); });
+        return r.json();
+      })
+      .then(function (data) {
+        addServerModal.style.display = "none";
+        currentServerId = data.id;
+        fetchServers();
+      })
+      .catch(function (err) {
+        modalError.textContent = err.message || "Failed to add server.";
+      })
+      .finally(function () {
+        modalAdd.disabled = false;
+        modalAdd.textContent = "Add Server";
+      });
+  });
 
   // ------ Update ------
   var updateStatusEl = document.getElementById("update-status");
@@ -368,7 +558,7 @@
     updateStatusEl.textContent = "Downloading " + latestVersion + "...";
     fetch("/api/update/apply", { method: "POST" })
       .then(function (r) { return r.json(); })
-      .then(function (data) {
+      .then(function () {
         updateStatusEl.textContent = "Restarting...";
         setTimeout(function () {
           updateStatusEl.textContent = "Reconnecting...";
@@ -401,10 +591,10 @@
   // ------ Theme toggle ------
   var themeToggleBtn = document.getElementById("theme-toggle");
   var themeIcon = document.getElementById("theme-icon");
-  var html = document.documentElement;
+  var htmlEl = document.documentElement;
 
   function setTheme(theme) {
-    html.setAttribute("data-theme", theme);
+    htmlEl.setAttribute("data-theme", theme);
     themeIcon.innerHTML = theme === "dark" ? "&#9790;" : "&#9728;";
     try { localStorage.setItem("ais-theme", theme); } catch (e) {}
   }
@@ -420,15 +610,27 @@
   setTheme(loadTheme());
 
   themeToggleBtn.addEventListener("click", function () {
-    var current = html.getAttribute("data-theme");
+    var current = htmlEl.getAttribute("data-theme");
     setTheme(current === "dark" ? "light" : "dark");
   });
 
+  function escapeHTML(str) {
+    if (!str) return "";
+    return str.replace(/&/g, "&amp;")
+              .replace(/</g, "&lt;")
+              .replace(/>/g, "&gt;")
+              .replace(/"/g, "&quot;");
+  }
+
+  // ------ Polling loop (2 requests per cycle: servers+global, server status+ships) ------
+  function poll() {
+    fetchServers();
+    fetchServerStatus();
+    fetchShips();
+  }
+
   // ------ Init ------
   setupSortHeaders();
-  loadConfig();
-  fetchStatus();
-  fetchShips();
-  setInterval(fetchStatus, 2000);
-  setInterval(fetchShips, 2000);
+  poll();
+  setInterval(poll, 2000);
 })();

@@ -16,10 +16,6 @@
           <span class="dot" id="ais-dot"></span>
           AIS Stream
         </span>
-        <span class="indicator">
-          <span class="dot" id="hook-dot"></span>
-          DCS Hook
-        </span>
       </div>
       <button class="theme-toggle" id="theme-toggle" title="Toggle theme">
         <span id="theme-icon">&#9790;</span>
@@ -29,75 +25,117 @@
 
   <main class="dashboard">
     <section class="sidebar">
-      <div class="toggle-row">
-        <span class="toggle-text" id="toggle-text">Disabled</span>
-        <label class="switch">
-          <input type="checkbox" id="enable-toggle">
-          <span class="slider"></span>
-        </label>
+      <!-- Server selector -->
+      <div class="server-selector">
+        <select id="server-select"></select>
+        <button class="btn btn-icon" id="add-server-btn" title="Add server">+</button>
       </div>
 
-      <div class="info-row">
-        <div class="info-item">
-          <span class="info-label">Theatre</span>
-          <span class="info-value" id="theatre-value">--</span>
-        </div>
-        <div class="info-item">
-          <span class="info-label">Models</span>
-          <span class="info-value" id="models-value">--</span>
-        </div>
+      <!-- No-server welcome -->
+      <div class="welcome-state" id="welcome-state" style="display:none">
+        <p>No DCS servers configured.</p>
+        <p>Click <strong>+</strong> to add your first server.</p>
       </div>
 
-      <div class="stats-row">
-        <div class="stat-block">
-          <span class="stat-number accent" id="spawned-count">0</span>
-          <span class="stat-label">In DCS</span>
+      <!-- Per-server panel (hidden when no server selected) -->
+      <div id="server-panel" style="display:none">
+        <div class="toggle-row">
+          <span class="toggle-text" id="toggle-text">Disabled</span>
+          <label class="switch">
+            <input type="checkbox" id="enable-toggle">
+            <span class="slider"></span>
+          </label>
         </div>
-        <div class="stat-block">
-          <span class="stat-number yellow" id="pending-count">0</span>
-          <span class="stat-label">Pending</span>
+
+        <div class="info-row">
+          <div class="info-item">
+            <span class="info-label">Theatre</span>
+            <span class="info-value" id="theatre-value">--</span>
+          </div>
+          <div class="info-item">
+            <span class="info-label">Models</span>
+            <span class="info-value" id="models-value">--</span>
+          </div>
         </div>
-        <div class="stat-block">
-          <span class="stat-number" id="ship-count">0</span>
-          <span class="stat-label">Tracked</span>
+
+        <div class="conn-row">
+          <span class="indicator">
+            <span class="dot" id="hook-dot"></span>
+            DCS Hook
+          </span>
+          <span class="hook-deploy-status" id="hook-deploy-status"></span>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat-block">
+            <span class="stat-number accent" id="spawned-count">0</span>
+            <span class="stat-label">In DCS</span>
+          </div>
+          <div class="stat-block">
+            <span class="stat-number yellow" id="pending-count">0</span>
+            <span class="stat-label">Pending</span>
+          </div>
+          <div class="stat-block">
+            <span class="stat-number" id="ship-count">0</span>
+            <span class="stat-label">Tracked</span>
+          </div>
+        </div>
+
+        <div class="category-bar" id="category-bar"></div>
+
+        <div class="divider"></div>
+
+        <div class="section-block">
+          <h2>Server Settings</h2>
+          <div class="setting-row">
+            <label for="max-ships">Max Ships <span id="max-ships-val">100</span></label>
+            <input type="range" id="max-ships" min="10" max="200" value="100">
+          </div>
+          <div class="setting-row">
+            <label for="update-interval">Update Interval <span id="update-interval-val">30</span>s</label>
+            <input type="range" id="update-interval" min="10" max="60" value="30">
+          </div>
+          <div class="setting-row">
+            <label>Saved Games Path</label>
+            <div class="path-row">
+              <span class="path-value" id="saved-games-path">--</span>
+              <button class="btn btn-sm" id="deploy-hook-btn">Deploy Hook</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="section-block">
+          <h2>Filters</h2>
+          <div class="filter-grid">
+            <label class="filter-item"><input type="checkbox" data-filter="fishing" checked> Fishing</label>
+            <label class="filter-item"><input type="checkbox" data-filter="cargo" checked> Cargo</label>
+            <label class="filter-item"><input type="checkbox" data-filter="tanker" checked> Tanker</label>
+            <label class="filter-item"><input type="checkbox" data-filter="passenger" checked> Passenger</label>
+            <label class="filter-item"><input type="checkbox" data-filter="tug" checked> Tug</label>
+            <label class="filter-item"><input type="checkbox" data-filter="pleasure" checked> Pleasure</label>
+            <label class="filter-item"><input type="checkbox" data-filter="other" checked> Other</label>
+          </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="section-block">
+          <button class="btn btn-danger" id="remove-server-btn">Remove Server</button>
         </div>
       </div>
-
-      <div class="category-bar" id="category-bar"></div>
 
       <div class="divider"></div>
 
       <div class="section-block">
-        <h2>Settings</h2>
+        <h2>Global Settings</h2>
         <div class="setting-row">
           <label for="api-key">API Key</label>
           <div class="api-key-row">
             <input type="password" id="api-key" placeholder="aisstream.io API key" autocomplete="off">
             <button class="btn" id="save-api-key">Save</button>
           </div>
-        </div>
-        <div class="setting-row">
-          <label for="max-ships">Max Ships <span id="max-ships-val">100</span></label>
-          <input type="range" id="max-ships" min="10" max="200" value="100">
-        </div>
-        <div class="setting-row">
-          <label for="update-interval">Update Interval <span id="update-interval-val">30</span>s</label>
-          <input type="range" id="update-interval" min="10" max="60" value="30">
-        </div>
-      </div>
-
-      <div class="divider"></div>
-
-      <div class="section-block">
-        <h2>Filters</h2>
-        <div class="filter-grid">
-          <label class="filter-item"><input type="checkbox" data-filter="fishing" checked> Fishing</label>
-          <label class="filter-item"><input type="checkbox" data-filter="cargo" checked> Cargo</label>
-          <label class="filter-item"><input type="checkbox" data-filter="tanker" checked> Tanker</label>
-          <label class="filter-item"><input type="checkbox" data-filter="passenger" checked> Passenger</label>
-          <label class="filter-item"><input type="checkbox" data-filter="tug" checked> Tug</label>
-          <label class="filter-item"><input type="checkbox" data-filter="pleasure" checked> Pleasure</label>
-          <label class="filter-item"><input type="checkbox" data-filter="other" checked> Other</label>
         </div>
       </div>
 
@@ -137,6 +175,26 @@
       </div>
     </section>
   </main>
+
+  <!-- Add Server Modal -->
+  <div class="modal-overlay" id="add-server-modal" style="display:none">
+    <div class="modal glass">
+      <h3>Add DCS Server</h3>
+      <div class="modal-field">
+        <label for="new-server-name">Server Name</label>
+        <input type="text" id="new-server-name" placeholder="e.g. Syria Main">
+      </div>
+      <div class="modal-field">
+        <label for="new-server-path">Saved Games Path</label>
+        <input type="text" id="new-server-path" placeholder="C:\Users\...\Saved Games\DCS.server">
+      </div>
+      <div class="modal-actions">
+        <button class="btn" id="modal-cancel">Cancel</button>
+        <button class="btn btn-accent" id="modal-add">Add Server</button>
+      </div>
+      <div class="modal-error" id="modal-error"></div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>

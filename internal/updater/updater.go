@@ -126,7 +126,6 @@ func Apply(rel *Release) error {
 	exeDir := filepath.Dir(exePath)
 
 	newExe := filepath.Join(stageDir, "DCS AIS Traffic.exe")
-	newLua := filepath.Join(stageDir, "lua", "AISTrafficHook.lua")
 
 	if _, err := os.Stat(newExe); err != nil {
 		return fmt.Errorf("new exe not found in zip: %w", err)
@@ -134,11 +133,11 @@ func Apply(rel *Release) error {
 
 	// Build restart batch script.
 	batPath := filepath.Join(os.TempDir(), "ais-update-restart.bat")
-	luaCopyLine := ""
-	if _, err := os.Stat(newLua); err == nil {
-		luaDst := filepath.Join(exeDir, "lua", "AISTrafficHook.lua")
-		luaCopyLine = fmt.Sprintf("copy /y \"%s\" \"%s\"\r\n", newLua, luaDst)
-	}
+
+	// Clean up obsolete files from older versions. The lua/ directory in the
+	// install folder is no longer needed — hooks are now auto-deployed to each
+	// server's Saved Games path by the hookdeploy package.
+	obsoleteLuaDir := filepath.Join(exeDir, "lua")
 
 	bat := fmt.Sprintf(
 		"@echo off\r\n"+
@@ -146,14 +145,14 @@ func Apply(rel *Release) error {
 			"taskkill /f /im \"DCS AIS Traffic.exe\" >nul 2>&1\r\n"+
 			"timeout /t 1 /nobreak >nul\r\n"+
 			"copy /y \"%s\" \"%s\"\r\n"+
-			"%s"+
+			"if exist \"%s\" rmdir /s /q \"%s\"\r\n"+
 			"cd /d \"%s\"\r\n"+
 			"start \"\" \"%s\"\r\n"+
 			"timeout /t 3 /nobreak >nul\r\n"+
 			"rmdir /s /q \"%s\"\r\n"+
 			"del \"%%~f0\"\r\n",
 		newExe, exePath,
-		luaCopyLine,
+		obsoleteLuaDir, obsoleteLuaDir,
 		exeDir, exePath,
 		stageDir,
 	)

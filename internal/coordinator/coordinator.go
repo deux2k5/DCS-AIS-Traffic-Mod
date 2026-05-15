@@ -69,36 +69,49 @@ func (s ShipState) MarshalJSON() ([]byte, error) {
 	return []byte(`"` + s.String() + `"`), nil
 }
 
-// Coordinator manages the lifecycle of tracked ships. It connects the AIS
-// feed to the DCS hook via spawn/move/remove commands.
+// OnTheatreChange is called when a coordinator detects a theatre change.
+// The caller should use this to trigger an AIS resubscription with updated
+// bounding boxes.
+type OnTheatreChange func()
+
+// Coordinator manages the lifecycle of tracked ships for a single DCS server
+// instance. It receives AIS updates from the outside and sends spawn/move/remove
+// commands to its assigned DCS hook via TCP.
 type Coordinator struct {
-	cfg    *config.Config
-	dcs    *dcscomm.Server
-	aisCli *ais.Client
-	cache  *shipcache.Cache
+	id        string
+	serverCfg *config.ServerConfig
+	globalCfg *config.Config
+	dcs       *dcscomm.Server
+	cache     *shipcache.Cache
+	models    modelRegistry
 
-	mu      sync.RWMutex
-	ships   map[int]*TrackedShip // keyed by MMSI
-	theatre string
-	stopCh  chan struct{}
+	onTheatreChange OnTheatreChange
+
+	mu       sync.RWMutex
+	ships    map[int]*TrackedShip // keyed by MMSI
+	theatre  string
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
-// New creates a Coordinator.
-func New(cfg *config.Config, dcs *dcscomm.Server, cache *shipcache.Cache) *Coordinator {
-	c := &Coordinator{
-		cfg:    cfg,
-		dcs:    dcs,
-		cache:  cache,
-		ships:  make(map[int]*TrackedShip),
-		stopCh: make(chan struct{}),
+// New creates a Coordinator for a single DCS server instance.
+func New(id string, serverCfg *config.ServerConfig, globalCfg *config.Config,
+	dcs *dcscomm.Server, cache *shipcache.Cache, onTheatreChange OnTheatreChange) *Coordinator {
+	return &Coordinator{
+		id:              id,
+		serverCfg:       serverCfg,
+		globalCfg:       globalCfg,
+		dcs:             dcs,
+		cache:           cache,
+		onTheatreChange: onTheatreChange,
+		ships:           make(map[int]*TrackedShip),
+		stopCh:          make(chan struct{}),
 	}
-	c.aisCli = ais.NewClient(c.onAISUpdate)
-	return c
 }
 
-// AISClient returns the underlying AIS client for status queries.
-func (c *Coordinator) AISClient() *ais.Client {
-	return c.aisCli
+// ID returns the server identifier for this coordinator.
+func (c *Coordinator) ID() string {
+	return c.id
 }
 
 // Theatre returns the current DCS theatre name.
@@ -108,10 +121,9 @@ func (c *Coordinator) Theatre() string {
 	return c.theatre
 }
 
-// SetTheatre updates the theatre and restarts the AIS feed for the new bounds.
-// This is called when the hook sends a "theatre" message, which happens at every
-// mission load. All spawned ships are reset to pending so they get re-spawned,
-// since the hook clears its tracked groups on mission load.
+// SetTheatre updates the theatre. All spawned ships are reset to pending so
+// they get re-spawned, since the hook clears its tracked groups on mission load.
+// Notifies the theatre change callback so AIS bounding boxes can be refreshed.
 func (c *Coordinator) SetTheatre(name string) {
 	c.mu.Lock()
 	c.theatre = name
@@ -119,14 +131,17 @@ func (c *Coordinator) SetTheatre(name string) {
 	for _, s := range c.ships {
 		if s.State == StateSpawned {
 			s.State = StatePending
-			s.GroupName = "" // will be re-frozen at next spawn
+			s.GroupName = ""
 			resetCount++
 		}
 	}
 	c.mu.Unlock()
 
-	log.Printf("[COORD] theatre set to %s, reset %d ships to pending", name, resetCount)
-	c.restartAIS()
+	log.Printf("[COORD:%s] theatre set to %s, reset %d ships to pending", c.id, name, resetCount)
+
+	if c.onTheatreChange != nil {
+		c.onTheatreChange()
+	}
 }
 
 // Ships returns a snapshot of all currently tracked ships.
@@ -141,7 +156,8 @@ func (c *Coordinator) Ships() []TrackedShip {
 	return out
 }
 
-// ShipCount returns the number of tracked ships.
+// ShipCount returns the number of tracked ships. Cheaper than Stats() when
+// only the count is needed (e.g., server list endpoint).
 func (c *Coordinator) ShipCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -163,15 +179,10 @@ func (c *Coordinator) Stats() CoordStats {
 	defer c.mu.RUnlock()
 
 	s := CoordStats{
-		Total:      len(c.ships),
-		Categories: make(map[string]int),
+		Total:        len(c.ships),
+		ModelsLoaded: c.models.count(),
+		Categories:   make(map[string]int),
 	}
-
-	modelMu.RLock()
-	if modelLoaded {
-		s.ModelsLoaded = len(modelSet)
-	}
-	modelMu.RUnlock()
 
 	for _, ship := range c.ships {
 		switch ship.State {
@@ -195,12 +206,12 @@ func (c *Coordinator) OnHookMessage(msg dcscomm.InboundMessage) {
 	case "theatre":
 		c.SetTheatre(msg.Theatre)
 	case "models":
-		SetAvailableModels(msg.Models)
-		log.Printf("[DCS] %d ship models available", len(msg.Models))
+		c.models.setAvailableModels(msg.Models)
+		log.Printf("[COORD:%s] %d ship models available", c.id, len(msg.Models))
 	case "status":
-		log.Printf("[DCS] status: %d ships", msg.Ships)
+		log.Printf("[COORD:%s] hook status: %d ships", c.id, msg.Ships)
 	case "error":
-		log.Printf("[DCS] error: %s (group: %s)", msg.Error, msg.GroupName)
+		log.Printf("[COORD:%s] hook error: %s (group: %s)", c.id, msg.Error, msg.GroupName)
 	case "reject":
 		c.handleReject(msg)
 	}
@@ -216,121 +227,29 @@ func (c *Coordinator) handleReject(msg dcscomm.InboundMessage) {
 
 	for mmsi, s := range c.ships {
 		if s.GroupName == msg.GroupName {
-			log.Printf("[COORD] ship %d rejected by hook: %s", mmsi, msg.Reason)
+			log.Printf("[COORD:%s] ship %d rejected by hook: %s", c.id, mmsi, msg.Reason)
 			delete(c.ships, mmsi)
 			return
 		}
 	}
 }
 
-// Start begins the coordinator tick loop. Call in a goroutine.
-func (c *Coordinator) Start() {
-	c.cfg.RLock()
-	enabled := c.cfg.AIS.Enabled
-	c.cfg.RUnlock()
-
-	if enabled {
-		c.restartAIS()
-	}
-
-	c.cfg.RLock()
-	interval := time.Duration(c.cfg.AIS.UpdateSeconds) * time.Second
-	c.cfg.RUnlock()
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.stopCh:
-			c.aisCli.Stop()
-			return
-		case <-ticker.C:
-			c.tick()
-
-			// Re-read interval in case it changed.
-			c.cfg.RLock()
-			newInterval := time.Duration(c.cfg.AIS.UpdateSeconds) * time.Second
-			c.cfg.RUnlock()
-			if newInterval != interval {
-				interval = newInterval
-				ticker.Reset(interval)
-			}
-		}
-	}
-}
-
-// Stop signals the coordinator to shut down.
-func (c *Coordinator) Stop() {
-	close(c.stopCh)
-	c.cache.Stop()
-}
-
-// Toggle enables or disables AIS tracking.
-func (c *Coordinator) Toggle(enabled bool) {
-	c.cfg.Lock()
-	c.cfg.AIS.Enabled = enabled
-	c.cfg.Unlock()
-	_ = c.cfg.Save()
-
-	if enabled {
-		c.restartAIS()
-	} else {
-		c.disable()
-	}
-}
-
-func (c *Coordinator) disable() {
-	c.aisCli.Stop()
-
-	// Send clear to DCS.
-	if err := c.dcs.Send(dcscomm.NewClear()); err != nil {
-		log.Printf("[COORD] clear error: %v", err)
-	}
-
-	// Mark all ships removed.
-	c.mu.Lock()
-	c.ships = make(map[int]*TrackedShip)
-	c.mu.Unlock()
-
-	log.Println("[COORD] disabled, all ships cleared")
-}
-
-// RestartAIS triggers a reconnect of the AIS WebSocket client (e.g. after an
-// API key change).
-func (c *Coordinator) RestartAIS() {
-	c.restartAIS()
-}
-
-func (c *Coordinator) restartAIS() {
-	c.cfg.RLock()
-	apiKey := c.cfg.AIS.APIKey
-	enabled := c.cfg.AIS.Enabled
-	c.cfg.RUnlock()
-
-	if !enabled || apiKey == "" {
-		c.aisCli.Stop()
-		return
-	}
-
-	c.mu.RLock()
-	theatre := c.theatre
-	c.mu.RUnlock()
-
-	bb, ok := geo.TheatreBounds[theatre]
-	if !ok {
-		log.Printf("[COORD] unknown theatre %q, AIS stopped", theatre)
-		c.aisCli.Stop()
-		return
-	}
-
-	boxes := [][][2]float64{bb.AISBox()}
-	c.aisCli.Restart(apiKey, boxes)
-}
-
-func (c *Coordinator) onAISUpdate(u ais.ShipUpdate) {
+// OnAISUpdate processes a single AIS position/static-data update.
+// Called by the server manager's fan-out callback for each AIS message.
+func (c *Coordinator) OnAISUpdate(u ais.ShipUpdate) {
 	// Validate position.
 	if u.Latitude == 0 && u.Longitude == 0 {
+		return
+	}
+
+	// Only process if this server is enabled.
+	c.globalCfg.RLock()
+	srv := c.serverCfg
+	enabled := srv.Enabled
+	filters := srv.Filters
+	c.globalCfg.RUnlock()
+
+	if !enabled {
 		return
 	}
 
@@ -348,12 +267,7 @@ func (c *Coordinator) onAISUpdate(u ais.ShipUpdate) {
 
 	category := ShipCategory(u.ShipType)
 
-	// Check filter.
-	c.cfg.RLock()
-	allowed := isFilterAllowed(c.cfg.Filters, category)
-	c.cfg.RUnlock()
-
-	if !allowed {
+	if !isFilterAllowed(filters, category) {
 		return
 	}
 
@@ -391,7 +305,7 @@ func (c *Coordinator) onAISUpdate(u ais.ShipUpdate) {
 			Category: category,
 			Length:   length,
 			Beam:     beam,
-			DCSModel: DCSUnitType(shipType, length),
+			DCSModel: c.models.dcsUnitType(shipType, length),
 			State:    StatePending,
 		}
 		c.ships[u.MMSI] = ship
@@ -407,40 +321,96 @@ func (c *Coordinator) onAISUpdate(u ais.ShipUpdate) {
 		ship.Name = cleanName(u.Name)
 	}
 
-	// Update ship type if we got a real type (from ShipStaticData).
 	if u.ShipType > 0 && ship.ShipType == 0 {
 		ship.ShipType = u.ShipType
 		ship.Category = ShipCategory(u.ShipType)
 	}
 
-	// Update dimensions if we got new data.
 	if u.Length > 0 && u.Length != ship.Length {
 		ship.Length = u.Length
 		ship.Beam = u.Beam
 	}
 
-	// Re-pick model while still pending.
 	if ship.State == StatePending && (u.Length > 0 || u.ShipType > 0) {
-		ship.DCSModel = DCSUnitType(ship.ShipType, ship.Length)
+		ship.DCSModel = c.models.dcsUnitType(ship.ShipType, ship.Length)
 	}
 
-	// Persist to disk cache for next restart.
 	c.cache.Update(u.MMSI, ship.ShipType, ship.Length, ship.Beam, ship.Name)
 }
 
-// tickSnapshot holds per-ship data captured under lock for use outside the lock.
-type tickSnapshot struct {
-	mmsi    int
-	ship    TrackedShip // value copy
-	shipPtr *TrackedShip
+// Start begins the coordinator tick loop. Call in a goroutine.
+func (c *Coordinator) Start() {
+	c.globalCfg.RLock()
+	interval := time.Duration(c.serverCfg.UpdateSeconds) * time.Second
+	c.globalCfg.RUnlock()
+
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			c.tick()
+
+			// Re-read interval in case it changed.
+			c.globalCfg.RLock()
+			newInterval := time.Duration(c.serverCfg.UpdateSeconds) * time.Second
+			c.globalCfg.RUnlock()
+			if newInterval > 0 && newInterval != interval {
+				interval = newInterval
+				ticker.Reset(interval)
+			}
+		}
+	}
+}
+
+// Stop signals the coordinator to shut down and clears all ships from DCS.
+// Safe to call multiple times — subsequent calls are no-ops.
+func (c *Coordinator) Stop() {
+	c.stopOnce.Do(func() {
+		close(c.stopCh)
+		c.disable()
+	})
+}
+
+// Toggle enables or disables AIS tracking for this server.
+func (c *Coordinator) Toggle(enabled bool) {
+	c.globalCfg.Lock()
+	c.serverCfg.Enabled = enabled
+	c.globalCfg.Unlock()
+	_ = c.globalCfg.Save()
+
+	if !enabled {
+		c.disable()
+	}
+}
+
+func (c *Coordinator) disable() {
+	// Send clear to DCS.
+	if err := c.dcs.Send(dcscomm.NewClear()); err != nil {
+		log.Printf("[COORD:%s] clear error: %v", c.id, err)
+	}
+
+	// Mark all ships removed.
+	c.mu.Lock()
+	c.ships = make(map[int]*TrackedShip)
+	c.mu.Unlock()
+
+	log.Printf("[COORD:%s] disabled, all ships cleared", c.id)
 }
 
 func (c *Coordinator) tick() {
-	c.cfg.RLock()
-	enabled := c.cfg.AIS.Enabled
-	maxShips := c.cfg.AIS.MaxShips
-	staleMinutes := c.cfg.AIS.StaleMinutes
-	c.cfg.RUnlock()
+	c.globalCfg.RLock()
+	enabled := c.serverCfg.Enabled
+	maxShips := c.serverCfg.MaxShips
+	staleMinutes := c.serverCfg.StaleMinutes
+	c.globalCfg.RUnlock()
 
 	if !enabled {
 		return
@@ -496,9 +466,6 @@ func (c *Coordinator) tick() {
 
 	const staticThreshold = 0.5
 
-	// Build spawn commands. State changes are deferred until after a
-	// successful TCP send so a failed batch doesn't leave the coordinator
-	// out of sync with DCS.
 	type spawnCommit struct {
 		ship     *TrackedShip
 		name     string
@@ -522,15 +489,14 @@ func (c *Coordinator) tick() {
 		spawned++
 	}
 
-	// Build reroute/conversion commands for spawned ships.
 	type updateCommit struct {
-		ship       *TrackedShip
-		lat, lon   float64
-		hdg        float64
-		isStatic   bool      // new value after conversion
-		converted  bool      // static→group conversion
-		rerouted   bool
-		rerouteAt  time.Time
+		ship      *TrackedShip
+		lat, lon  float64
+		hdg       float64
+		isStatic  bool
+		converted bool
+		rerouted  bool
+		rerouteAt time.Time
 	}
 	var updateCmds []dcscomm.Command
 	var updateCommits []updateCommit
@@ -542,7 +508,6 @@ func (c *Coordinator) tick() {
 		headingRad := s.Heading * math.Pi / 180.0
 		speedMS := s.Sog * 0.514444
 
-		// Static→group conversion if the ship starts moving.
 		if s.IsStatic && s.Sog >= 1.0 {
 			updateCmds = append(updateCmds, dcscomm.NewRemove(s.GroupName))
 			updateCmds = append(updateCmds, dcscomm.NewSpawn(
@@ -558,13 +523,10 @@ func (c *Coordinator) tick() {
 			continue
 		}
 
-		// Per-ship reroute cooldown to avoid command churn from heading jitter.
 		if now.Sub(s.LastReroute) < minRerouteInterval {
 			continue
 		}
 
-		// Equirectangular distance approximation — much cheaper than haversine
-		// and accurate enough for a 200m threshold check.
 		dist := geo.EquirectangularDistance(s.SpawnedLat, s.SpawnedLon, s.Lat, s.Lon)
 		hdgDiff := math.Abs(s.Heading - s.SpawnedHdg)
 		if hdgDiff > 180 {
@@ -593,9 +555,7 @@ func (c *Coordinator) tick() {
 
 	if len(allCmds) > 0 {
 		if err := c.dcs.SendBatch(allCmds); err != nil {
-			log.Printf("[COORD] batch send error (%d cmds): %v", len(allCmds), err)
-			// Don't commit state changes — the commands didn't reach DCS.
-			// They'll be retried on the next tick.
+			log.Printf("[COORD:%s] batch send error (%d cmds): %v", c.id, len(allCmds), err)
 			return
 		}
 	}
@@ -650,7 +610,6 @@ func isFilterAllowed(f config.FilterConfig, category string) bool {
 }
 
 func cleanName(name string) string {
-	// Trim trailing spaces (AIS names are space-padded).
 	end := len(name)
 	for end > 0 && name[end-1] == ' ' {
 		end--

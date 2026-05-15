@@ -670,3 +670,171 @@ tbody tr:hover { background: var(--table-row-hover); }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-tertiary); }
 
 ::selection { background: var(--accent); color: #fff; }
+
+/* ===== Server selector ===== */
+.server-selector {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.server-selector select {
+  flex: 1;
+  padding: 7px 12px;
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  border-radius: var(--radius-xs);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font);
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.2s;
+  -webkit-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 28px;
+}
+.server-selector select:focus {
+  border-color: var(--accent);
+}
+.btn-icon {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  font-size: 18px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-xs);
+  flex-shrink: 0;
+}
+
+/* ===== Welcome state ===== */
+.welcome-state {
+  text-align: center;
+  padding: 30px 10px;
+  color: var(--text-tertiary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.welcome-state strong {
+  color: var(--accent);
+}
+
+/* ===== Connection row ===== */
+.conn-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0 4px;
+}
+.hook-deploy-status {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+}
+.hook-deploy-status.deployed {
+  color: var(--green);
+}
+
+/* ===== Path row ===== */
+.path-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.path-value {
+  flex: 1;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 11px;
+}
+
+/* ===== Danger button ===== */
+.btn-danger {
+  width: 100%;
+  background: transparent;
+  color: var(--red);
+  border-color: var(--red);
+  opacity: 0.7;
+}
+.btn-danger:hover {
+  opacity: 1;
+  background: rgba(255, 59, 48, 0.08);
+}
+
+/* ===== Modal ===== */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+}
+.modal {
+  width: 380px;
+  max-width: 90vw;
+  padding: 24px;
+  border-radius: var(--radius);
+}
+.modal h3 {
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 18px;
+  color: var(--text);
+}
+.modal-field {
+  margin-bottom: 14px;
+}
+.modal-field label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+.modal-field input[type="text"] {
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  border-radius: var(--radius-xs);
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font);
+  outline: none;
+  transition: border-color 0.2s;
+}
+.modal-field input[type="text"]:focus {
+  border-color: var(--accent);
+}
+.modal-field input[type="text"]::placeholder {
+  color: var(--text-tertiary);
+}
+.modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 20px;
+}
+.modal-error {
+  color: var(--red);
+  font-size: 12px;
+  margin-top: 10px;
+  min-height: 16px;
+}

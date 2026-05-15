@@ -36,16 +36,27 @@ type ServerListResponse struct {
 	Servers      []ServerSummary `json:"servers"`
 }
 
-// ServerSummary is a single entry in the server list.
+// ServerSummary is a single entry in the server list. Contains all fields
+// the dashboard needs so the frontend can poll a single endpoint per cycle
+// instead of separate list + per-server status calls.
 type ServerSummary struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	Enabled       bool   `json:"enabled"`
-	HookPort      int    `json:"hookPort"`
-	HookConnected bool   `json:"hookConnected"`
-	Theatre       string `json:"theatre"`
-	ShipCount     int    `json:"shipCount"`
-	HookDeployed  bool   `json:"hookDeployed"`
+	ID             string              `json:"id"`
+	Name           string              `json:"name"`
+	Enabled        bool                `json:"enabled"`
+	HookPort       int                 `json:"hookPort"`
+	HookConnected  bool                `json:"hookConnected"`
+	Theatre        string              `json:"theatre"`
+	ShipCount      int                 `json:"shipCount"`
+	SpawnedCount   int                 `json:"spawnedCount"`
+	PendingCount   int                 `json:"pendingCount"`
+	ModelsLoaded   int                 `json:"modelsLoaded"`
+	HookDeployed   bool                `json:"hookDeployed"`
+	SavedGamesPath string              `json:"savedGamesPath"`
+	MaxShips       int                 `json:"maxShips"`
+	UpdateSeconds  int                 `json:"updateSeconds"`
+	StaleMinutes   int                 `json:"staleMinutes"`
+	Categories     map[string]int      `json:"categories"`
+	Filters        config.FilterConfig `json:"filters"`
 }
 
 // ServerStatusResponse is returned by GET /api/servers/{id}/status.
@@ -192,16 +203,22 @@ func (s *Server) handleBrowseFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use PowerShell's folder browser dialog.
+	// FolderBrowserDialog requires STA threading. Use -STA flag and
+	// explicitly call ShowDialog with a dummy owner window handle.
 	script := `Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles()
 $f = New-Object System.Windows.Forms.FolderBrowserDialog
 $f.Description = "Select DCS Saved Games folder"
 $f.ShowNewFolderButton = $false
-if ($f.ShowDialog() -eq "OK") { $f.SelectedPath } else { "" }`
+$result = $f.ShowDialog()
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+  Write-Output $f.SelectedPath
+}`
 
-	cmd := exec.Command("powershell", "-NoProfile", "-Command", script)
+	cmd := exec.Command("powershell", "-STA", "-NoProfile", "-Command", script)
 	out, err := cmd.Output()
 	if err != nil {
+		log.Printf("[WEB] folder browse error: %v", err)
 		http.Error(w, "folder dialog failed", http.StatusInternalServerError)
 		return
 	}
@@ -224,16 +241,26 @@ func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
 	for _, srv := range servers {
 		inst := s.mgr.Instance(srv.ID)
 		summary := ServerSummary{
-			ID:       srv.ID,
-			Name:     srv.Name,
-			Enabled:  srv.Enabled,
-			HookPort: srv.HookPort,
+			ID:             srv.ID,
+			Name:           srv.Name,
+			Enabled:        srv.Enabled,
+			HookPort:       srv.HookPort,
+			SavedGamesPath: srv.SavedGamesPath,
+			MaxShips:       srv.MaxShips,
+			UpdateSeconds:  srv.UpdateSeconds,
+			StaleMinutes:   srv.StaleMinutes,
+			Filters:        srv.Filters,
 		}
 		if inst != nil {
 			summary.HookConnected = inst.DCSServer.IsConnected()
 			summary.Theatre = inst.Coordinator.Theatre()
-			summary.ShipCount = inst.Coordinator.ShipCount()
 			summary.HookDeployed = inst.HookDeployed
+			stats := inst.Coordinator.Stats()
+			summary.ShipCount = stats.Total
+			summary.SpawnedCount = stats.Spawned
+			summary.PendingCount = stats.Pending
+			summary.ModelsLoaded = stats.ModelsLoaded
+			summary.Categories = stats.Categories
 		}
 		summaries = append(summaries, summary)
 	}

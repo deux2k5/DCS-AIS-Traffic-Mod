@@ -156,12 +156,11 @@
     return ships;
   }
 
-  // ------ Server list (includes global AIS status to reduce poll requests) ------
+  // ------ Server list (single endpoint provides everything the UI needs) ------
   function fetchServers() {
     fetch("/api/servers")
       .then(function (r) { return r.json(); })
       .then(function (data) {
-        // Update global AIS indicator from combined response.
         aisDot.className = data.aisConnected ? "dot connected" : "dot";
 
         var servers = data.servers || [];
@@ -189,6 +188,14 @@
         }
 
         serverPanel.style.display = "block";
+
+        // Update the selected server's panel from the list data.
+        for (var j = 0; j < servers.length; j++) {
+          if (servers[j].id === currentServerId) {
+            updateServerPanel(servers[j]);
+            break;
+          }
+        }
       })
       .catch(function () {});
   }
@@ -211,72 +218,66 @@
 
   serverSelect.addEventListener("change", function () {
     currentServerId = serverSelect.value;
-    fetchServerStatus();
     fetchShips();
+    // Panel updates immediately from cached serverList.
+    for (var i = 0; i < serverList.length; i++) {
+      if (serverList[i].id === currentServerId) {
+        updateServerPanel(serverList[i]);
+        break;
+      }
+    }
   });
 
-  // Global AIS status is now included in fetchServers() response to reduce
-  // poll requests from 4 to 2 per cycle.
+  // ------ Per-server panel update (from server list data, no extra request) ------
+  function updateServerPanel(data) {
+    hookDot.className = data.hookConnected ? "dot connected" : "dot";
 
-  // ------ Per-server status ------
-  function fetchServerStatus() {
-    if (!currentServerId) return;
+    ignoreNextToggle = true;
+    enableToggle.checked = data.enabled;
+    toggleText.textContent = data.enabled ? "Enabled" : "Disabled";
+    toggleText.className = data.enabled ? "toggle-text active" : "toggle-text";
+    ignoreNextToggle = false;
 
-    fetch("/api/servers/" + currentServerId + "/status")
-      .then(function (r) { return r.json(); })
-      .then(function (data) {
-        hookDot.className = data.hookConnected ? "dot connected" : "dot";
+    theatreValue.textContent = data.theatre || "--";
+    modelsValue.textContent = data.modelsLoaded > 0 ? data.modelsLoaded : "--";
+    shipCount.textContent = data.shipCount;
+    spawnedCount.textContent = data.spawnedCount;
+    pendingCount.textContent = data.pendingCount;
 
-        ignoreNextToggle = true;
-        enableToggle.checked = data.enabled;
-        toggleText.textContent = data.enabled ? "Enabled" : "Disabled";
-        toggleText.className = data.enabled ? "toggle-text active" : "toggle-text";
-        ignoreNextToggle = false;
+    if (document.activeElement !== serverNameInput) {
+      serverNameInput.value = data.name || "";
+    }
 
-        theatreValue.textContent = data.theatre || "--";
-        modelsValue.textContent = data.modelsLoaded > 0 ? data.modelsLoaded : "--";
-        shipCount.textContent = data.shipCount;
-        spawnedCount.textContent = data.spawnedCount;
-        pendingCount.textContent = data.pendingCount;
+    maxShipsSlider.value = data.maxShips;
+    maxShipsVal.textContent = data.maxShips;
+    updateIntervalSlider.value = data.updateSeconds;
+    updateIntervalVal.textContent = data.updateSeconds;
 
-        // Only update name input if the user isn't actively editing it.
-        if (document.activeElement !== serverNameInput) {
-          serverNameInput.value = data.name || "";
+    savedGamesPath.textContent = data.savedGamesPath || "Not set";
+    savedGamesPath.title = data.savedGamesPath || "";
+
+    if (data.hookDeployed) {
+      hookDeployStatus.textContent = "Deployed";
+      hookDeployStatus.className = "hook-deploy-status deployed";
+    } else if (data.savedGamesPath) {
+      hookDeployStatus.textContent = "Not deployed";
+      hookDeployStatus.className = "hook-deploy-status";
+    } else {
+      hookDeployStatus.textContent = "";
+      hookDeployStatus.className = "hook-deploy-status";
+    }
+
+    var filters = data.filters;
+    if (filters) {
+      document.querySelectorAll("[data-filter]").forEach(function (el) {
+        var key = el.getAttribute("data-filter");
+        if (filters.hasOwnProperty(key)) {
+          el.checked = filters[key];
         }
+      });
+    }
 
-        maxShipsSlider.value = data.maxShips;
-        maxShipsVal.textContent = data.maxShips;
-        updateIntervalSlider.value = data.updateSeconds;
-        updateIntervalVal.textContent = data.updateSeconds;
-
-        savedGamesPath.textContent = data.savedGamesPath || "Not set";
-        savedGamesPath.title = data.savedGamesPath || "";
-
-        if (data.hookDeployed) {
-          hookDeployStatus.textContent = "Deployed";
-          hookDeployStatus.className = "hook-deploy-status deployed";
-        } else if (data.savedGamesPath) {
-          hookDeployStatus.textContent = "Not deployed";
-          hookDeployStatus.className = "hook-deploy-status";
-        } else {
-          hookDeployStatus.textContent = "";
-          hookDeployStatus.className = "hook-deploy-status";
-        }
-
-        // Update filter checkboxes.
-        var filters = data.filters;
-        if (filters) {
-          document.querySelectorAll("[data-filter]").forEach(function (el) {
-            var key = el.getAttribute("data-filter");
-            if (filters.hasOwnProperty(key)) {
-              el.checked = filters[key];
-            }
-          });
-        }
-
-        renderCategoryBar(data.categories || {}, data.shipCount || 0);
-      })
-      .catch(function () {});
+    renderCategoryBar(data.categories || {}, data.shipCount || 0);
   }
 
   function renderCategoryBar(cats, total) {
@@ -507,7 +508,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ savedGamesPath: path })
       }).then(function () {
-        fetchServerStatus();
+        fetchServers();
       });
     });
   });
@@ -679,10 +680,9 @@
               .replace(/"/g, "&quot;");
   }
 
-  // ------ Polling loop (2 requests per cycle: servers+global, server status+ships) ------
+  // ------ Polling loop (2 requests per cycle: servers+global, ships) ------
   function poll() {
     fetchServers();
-    fetchServerStatus();
     fetchShips();
   }
 

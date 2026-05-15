@@ -404,13 +404,20 @@ func (c *Coordinator) ToggleTracking(enabled bool) {
 }
 
 // ToggleSpawning enables or disables spawning tracked ships into DCS.
+// Enabling spawning also enables tracking (can't spawn without data).
 // When disabled, ships remain tracked but are removed from DCS and reset
 // to pending. When re-enabled, pending ships spawn on the next tick.
 func (c *Coordinator) ToggleSpawning(enabled bool) {
 	c.globalCfg.Lock()
 	c.serverCfg.SpawnEnabled = enabled
+	if enabled {
+		c.serverCfg.TrackingEnabled = true
+	}
 	if srv := c.globalCfg.ServerByID(c.id); srv != nil {
 		srv.SpawnEnabled = enabled
+		if enabled {
+			srv.TrackingEnabled = true
+		}
 	}
 	c.globalCfg.Unlock()
 	_ = c.globalCfg.Save()

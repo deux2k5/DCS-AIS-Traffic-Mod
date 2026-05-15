@@ -462,6 +462,13 @@
     if (ignoreNextSpawn || !currentServerId) return;
     var on = spawnToggle.checked;
 
+    // Enabling spawn also enables tracking (server enforces this too).
+    if (on && !trackingToggle.checked) {
+      ignoreNextTracking = true;
+      trackingToggle.checked = true;
+      ignoreNextTracking = false;
+    }
+
     fetch("/api/servers/" + currentServerId + "/toggle", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

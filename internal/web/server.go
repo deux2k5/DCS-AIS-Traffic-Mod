@@ -501,15 +501,24 @@ func (s *Server) handleServerToggle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Coordinator methods handle config persistence internally.
+	trackingChanged := false
 	if req.TrackingEnabled != nil {
 		inst.Coordinator.ToggleTracking(*req.TrackingEnabled)
+		trackingChanged = true
 	}
 	if req.SpawnEnabled != nil {
 		inst.Coordinator.ToggleSpawning(*req.SpawnEnabled)
+		// Enabling spawn also enables tracking (coordinator enforces this).
+		if *req.SpawnEnabled {
+			trackingChanged = true
+		}
 	}
 
-	// Refresh AIS since tracking state affects which theatres are active.
-	s.mgr.RefreshAIS()
+	// Only refresh AIS when tracking state changed — spawn-only toggles
+	// don't affect which theatres need AIS subscriptions.
+	if trackingChanged {
+		s.mgr.RefreshAIS()
+	}
 
 	// Return current state.
 	s.cfg.RLock()

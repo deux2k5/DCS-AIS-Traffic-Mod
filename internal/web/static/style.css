@@ -233,7 +233,18 @@ body::before {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 2px 0 16px;
+  padding: 2px 0 8px;
+}
+.toggle-row + .toggle-row {
+  padding-top: 0;
+  padding-bottom: 16px;
+}
+
+.toggle-label {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text-secondary);
 }
 
 .toggle-text {

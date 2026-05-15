@@ -19,15 +19,17 @@ type ConfigData struct {
 
 // ServerConfig holds per-DCS-server settings.
 type ServerConfig struct {
-	ID             string       `toml:"id"               json:"id"`
-	Name           string       `toml:"name"             json:"name"`
-	HookPort       int          `toml:"hook-port"        json:"hookPort"`
-	SavedGamesPath string       `toml:"saved-games-path" json:"savedGamesPath"`
-	Enabled        bool         `toml:"enabled"          json:"enabled"`
-	MaxShips       int          `toml:"max-ships"        json:"maxShips"`
-	UpdateSeconds  int          `toml:"update-seconds"   json:"updateSeconds"`
-	StaleMinutes   int          `toml:"stale-minutes"    json:"staleMinutes"`
-	Filters        FilterConfig `toml:"filters"          json:"filters"`
+	ID              string       `toml:"id"                json:"id"`
+	Name            string       `toml:"name"              json:"name"`
+	HookPort        int          `toml:"hook-port"         json:"hookPort"`
+	SavedGamesPath  string       `toml:"saved-games-path"  json:"savedGamesPath"`
+	Enabled         bool         `toml:"enabled,omitempty"  json:"-"`               // deprecated: migrated to tracking/spawn on load
+	TrackingEnabled bool         `toml:"tracking-enabled"  json:"trackingEnabled"`
+	SpawnEnabled    bool         `toml:"spawn-enabled"     json:"spawnEnabled"`
+	MaxShips        int          `toml:"max-ships"         json:"maxShips"`
+	UpdateSeconds   int          `toml:"update-seconds"    json:"updateSeconds"`
+	StaleMinutes    int          `toml:"stale-minutes"     json:"staleMinutes"`
+	Filters         FilterConfig `toml:"filters"           json:"filters"`
 }
 
 // Config holds all application configuration.
@@ -89,11 +91,12 @@ func DefaultFilters() FilterConfig {
 // ID, Name, HookPort, and SavedGamesPath must be set by the caller.
 func DefaultServerConfig() ServerConfig {
 	return ServerConfig{
-		Enabled:       true,
-		MaxShips:      100,
-		UpdateSeconds: 30,
-		StaleMinutes:  10,
-		Filters:       DefaultFilters(),
+		TrackingEnabled: true,
+		SpawnEnabled:    true,
+		MaxShips:        100,
+		UpdateSeconds:   30,
+		StaleMinutes:    10,
+		Filters:         DefaultFilters(),
 	}
 }
 
@@ -172,15 +175,16 @@ func migrateV1(data []byte) (*Config, error) {
 			},
 			Servers: []ServerConfig{
 				{
-					ID:             "server-1",
-					Name:           "DCS Server",
-					HookPort:       hookPort,
-					SavedGamesPath: "", // user must set via UI
-					Enabled:        false,
-					MaxShips:       maxShips,
-					UpdateSeconds:  updateSecs,
-					StaleMinutes:   staleMins,
-					Filters:        old.Filters,
+					ID:              "server-1",
+					Name:            "DCS Server",
+					HookPort:        hookPort,
+					SavedGamesPath:  "", // user must set via UI
+					TrackingEnabled: false,
+					SpawnEnabled:    false,
+					MaxShips:        maxShips,
+					UpdateSeconds:   updateSecs,
+					StaleMinutes:    staleMins,
+					Filters:         old.Filters,
 				},
 			},
 		},
@@ -235,7 +239,34 @@ func Load(path string) (*Config, error) {
 	if err := toml.Unmarshal(data, cfg); err != nil {
 		return nil, err
 	}
+
+	// Migrate old "enabled" field to split tracking/spawn fields.
+	if cfg.migrateEnabledField(data) {
+		_ = cfg.save()
+	}
+
 	return cfg, nil
+}
+
+// migrateEnabledField converts the deprecated single "enabled" boolean to the
+// split "tracking-enabled" / "spawn-enabled" fields. Only runs when the file
+// predates the split (doesn't contain either new key). Returns true if any
+// migration occurred.
+func (c *Config) migrateEnabledField(data []byte) bool {
+	raw := string(data)
+	if strings.Contains(raw, "tracking-enabled") || strings.Contains(raw, "spawn-enabled") {
+		return false
+	}
+	migrated := false
+	for i := range c.Servers {
+		if c.Servers[i].Enabled {
+			c.Servers[i].TrackingEnabled = true
+			c.Servers[i].SpawnEnabled = true
+			c.Servers[i].Enabled = false
+			migrated = true
+		}
+	}
+	return migrated
 }
 
 // Save writes the current config to disk.

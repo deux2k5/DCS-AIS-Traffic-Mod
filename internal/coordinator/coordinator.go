@@ -242,14 +242,14 @@ func (c *Coordinator) OnAISUpdate(u ais.ShipUpdate) {
 		return
 	}
 
-	// Only process if this server is enabled.
+	// Only process if tracking is enabled for this server.
 	c.globalCfg.RLock()
 	srv := c.serverCfg
-	enabled := srv.Enabled
+	trackingEnabled := srv.TrackingEnabled
 	filters := srv.Filters
 	c.globalCfg.RUnlock()
 
-	if !enabled {
+	if !trackingEnabled {
 		return
 	}
 
@@ -375,44 +375,81 @@ func (c *Coordinator) Start() {
 func (c *Coordinator) Stop() {
 	c.stopOnce.Do(func() {
 		close(c.stopCh)
-		c.disable()
+		c.disableAll()
 	})
 }
 
-// Toggle enables or disables AIS tracking for this server.
-func (c *Coordinator) Toggle(enabled bool) {
+// ToggleTracking enables or disables AIS data tracking for this server.
+// Disabling tracking also disables spawning (can't spawn without data).
+func (c *Coordinator) ToggleTracking(enabled bool) {
 	c.globalCfg.Lock()
-	c.serverCfg.Enabled = enabled
+	c.serverCfg.TrackingEnabled = enabled
+	if !enabled {
+		c.serverCfg.SpawnEnabled = false
+	}
 	c.globalCfg.Unlock()
 	_ = c.globalCfg.Save()
 
 	if !enabled {
-		c.disable()
+		c.disableAll()
 	}
 }
 
-func (c *Coordinator) disable() {
-	// Send clear to DCS.
+// ToggleSpawning enables or disables spawning tracked ships into DCS.
+// When disabled, ships remain tracked but are removed from DCS and reset
+// to pending. When re-enabled, pending ships spawn on the next tick.
+func (c *Coordinator) ToggleSpawning(enabled bool) {
+	c.globalCfg.Lock()
+	c.serverCfg.SpawnEnabled = enabled
+	c.globalCfg.Unlock()
+	_ = c.globalCfg.Save()
+
+	if !enabled {
+		c.clearSpawned()
+	}
+}
+
+// disableAll clears all ships from DCS and the tracking map.
+func (c *Coordinator) disableAll() {
 	if err := c.dcs.Send(dcscomm.NewClear()); err != nil {
 		log.Printf("[COORD:%s] clear error: %v", c.id, err)
 	}
 
-	// Mark all ships removed.
 	c.mu.Lock()
 	c.ships = make(map[int]*TrackedShip)
 	c.mu.Unlock()
 
-	log.Printf("[COORD:%s] disabled, all ships cleared", c.id)
+	log.Printf("[COORD:%s] tracking disabled, all ships cleared", c.id)
+}
+
+// clearSpawned removes spawned ships from DCS but keeps them in the
+// tracking table as pending so they can be re-spawned later.
+func (c *Coordinator) clearSpawned() {
+	if err := c.dcs.Send(dcscomm.NewClear()); err != nil {
+		log.Printf("[COORD:%s] clear error: %v", c.id, err)
+	}
+
+	c.mu.Lock()
+	for _, s := range c.ships {
+		if s.State == StateSpawned {
+			s.State = StatePending
+			s.GroupName = ""
+		}
+	}
+	c.mu.Unlock()
+
+	log.Printf("[COORD:%s] spawning disabled, ships reset to pending", c.id)
 }
 
 func (c *Coordinator) tick() {
 	c.globalCfg.RLock()
-	enabled := c.serverCfg.Enabled
+	trackingEnabled := c.serverCfg.TrackingEnabled
+	spawnEnabled := c.serverCfg.SpawnEnabled
 	maxShips := c.serverCfg.MaxShips
 	staleMinutes := c.serverCfg.StaleMinutes
 	c.globalCfg.RUnlock()
 
-	if !enabled {
+	if !trackingEnabled {
 		return
 	}
 
@@ -447,23 +484,11 @@ func (c *Coordinator) tick() {
 		delete(c.ships, mmsi)
 	}
 
-	// Collect pending ships sorted by SOG descending.
+	// Collect pending ships to spawn (only if spawning is enabled).
 	type pendingEntry struct {
 		mmsi int
 		ship *TrackedShip
 	}
-	var pending []pendingEntry
-	for mmsi, s := range c.ships {
-		if s.State == StatePending {
-			pending = append(pending, pendingEntry{mmsi, s})
-		}
-	}
-	if len(pending) > 1 {
-		sort.Slice(pending, func(i, j int) bool {
-			return pending[i].ship.Sog > pending[j].ship.Sog
-		})
-	}
-
 	const staticThreshold = 0.5
 
 	type spawnCommit struct {
@@ -473,22 +498,38 @@ func (c *Coordinator) tick() {
 	}
 	var spawnCmds []dcscomm.Command
 	var spawnCommits []spawnCommit
-	for _, pe := range pending {
-		if spawned >= maxShips {
-			break
-		}
-		s := pe.ship
-		groupName := fmt.Sprintf("%s - %d", s.Name, pe.mmsi)
-		headingRad := s.Heading * math.Pi / 180.0
-		speedMS := s.Sog * 0.514444
-		isStatic := s.Sog < staticThreshold
 
-		spawnCmds = append(spawnCmds, dcscomm.NewSpawn(
-			groupName, s.DCSModel, s.Lat, s.Lon, headingRad, speedMS, s.Name, isStatic))
-		spawnCommits = append(spawnCommits, spawnCommit{ship: s, name: groupName, isStatic: isStatic})
-		spawned++
+	if spawnEnabled {
+		var pending []pendingEntry
+		for mmsi, s := range c.ships {
+			if s.State == StatePending {
+				pending = append(pending, pendingEntry{mmsi, s})
+			}
+		}
+		if len(pending) > 1 {
+			sort.Slice(pending, func(i, j int) bool {
+				return pending[i].ship.Sog > pending[j].ship.Sog
+			})
+		}
+
+		for _, pe := range pending {
+			if spawned >= maxShips {
+				break
+			}
+			s := pe.ship
+			groupName := fmt.Sprintf("%s - %d", s.Name, pe.mmsi)
+			headingRad := s.Heading * math.Pi / 180.0
+			speedMS := s.Sog * 0.514444
+			isStatic := s.Sog < staticThreshold
+
+			spawnCmds = append(spawnCmds, dcscomm.NewSpawn(
+				groupName, s.DCSModel, s.Lat, s.Lon, headingRad, speedMS, s.Name, isStatic))
+			spawnCommits = append(spawnCommits, spawnCommit{ship: s, name: groupName, isStatic: isStatic})
+			spawned++
+		}
 	}
 
+	// Update/reroute spawned ships (only if spawning is enabled).
 	type updateCommit struct {
 		ship      *TrackedShip
 		lat, lon  float64
@@ -500,46 +541,49 @@ func (c *Coordinator) tick() {
 	}
 	var updateCmds []dcscomm.Command
 	var updateCommits []updateCommit
-	for _, s := range c.ships {
-		if s.State != StateSpawned || s.GroupName == "" {
-			continue
-		}
 
-		headingRad := s.Heading * math.Pi / 180.0
-		speedMS := s.Sog * 0.514444
+	if spawnEnabled {
+		for _, s := range c.ships {
+			if s.State != StateSpawned || s.GroupName == "" {
+				continue
+			}
 
-		if s.IsStatic && s.Sog >= 1.0 {
-			updateCmds = append(updateCmds, dcscomm.NewRemove(s.GroupName))
-			updateCmds = append(updateCmds, dcscomm.NewSpawn(
-				s.GroupName, s.DCSModel, s.Lat, s.Lon, headingRad, speedMS, s.Name, false))
-			updateCommits = append(updateCommits, updateCommit{
-				ship: s, lat: s.Lat, lon: s.Lon, hdg: s.Heading,
-				isStatic: false, converted: true,
-			})
-			continue
-		}
+			headingRad := s.Heading * math.Pi / 180.0
+			speedMS := s.Sog * 0.514444
 
-		if s.IsStatic {
-			continue
-		}
+			if s.IsStatic && s.Sog >= 1.0 {
+				updateCmds = append(updateCmds, dcscomm.NewRemove(s.GroupName))
+				updateCmds = append(updateCmds, dcscomm.NewSpawn(
+					s.GroupName, s.DCSModel, s.Lat, s.Lon, headingRad, speedMS, s.Name, false))
+				updateCommits = append(updateCommits, updateCommit{
+					ship: s, lat: s.Lat, lon: s.Lon, hdg: s.Heading,
+					isStatic: false, converted: true,
+				})
+				continue
+			}
 
-		if now.Sub(s.LastReroute) < minRerouteInterval {
-			continue
-		}
+			if s.IsStatic {
+				continue
+			}
 
-		dist := geo.EquirectangularDistance(s.SpawnedLat, s.SpawnedLon, s.Lat, s.Lon)
-		hdgDiff := math.Abs(s.Heading - s.SpawnedHdg)
-		if hdgDiff > 180 {
-			hdgDiff = 360 - hdgDiff
-		}
+			if now.Sub(s.LastReroute) < minRerouteInterval {
+				continue
+			}
 
-		if dist > 200 || hdgDiff > 5 {
-			updateCmds = append(updateCmds, dcscomm.NewReroute(
-				s.GroupName, s.DCSModel, s.Lat, s.Lon, headingRad, speedMS, s.Name))
-			updateCommits = append(updateCommits, updateCommit{
-				ship: s, lat: s.Lat, lon: s.Lon, hdg: s.Heading,
-				rerouted: true, rerouteAt: now,
-			})
+			dist := geo.EquirectangularDistance(s.SpawnedLat, s.SpawnedLon, s.Lat, s.Lon)
+			hdgDiff := math.Abs(s.Heading - s.SpawnedHdg)
+			if hdgDiff > 180 {
+				hdgDiff = 360 - hdgDiff
+			}
+
+			if dist > 200 || hdgDiff > 5 {
+				updateCmds = append(updateCmds, dcscomm.NewReroute(
+					s.GroupName, s.DCSModel, s.Lat, s.Lon, headingRad, speedMS, s.Name))
+				updateCommits = append(updateCommits, updateCommit{
+					ship: s, lat: s.Lat, lon: s.Lon, hdg: s.Heading,
+					rerouted: true, rerouteAt: now,
+				})
+			}
 		}
 	}
 

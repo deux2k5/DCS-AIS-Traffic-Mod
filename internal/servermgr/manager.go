@@ -292,11 +292,11 @@ func (m *Manager) RefreshAIS() {
 // a detected theatre. Careful lock ordering: config lock first, then m.mu, never
 // nested, to avoid deadlock with RemoveServer which takes m.mu then cfg.
 func (m *Manager) activeBoxes() [][][2]float64 {
-	// Snapshot enabled server IDs from config (cfg lock only).
+	// Snapshot tracking-enabled server IDs from config (cfg lock only).
 	m.cfg.RLock()
 	enabledSet := make(map[string]bool, len(m.cfg.Servers))
 	for _, srv := range m.cfg.Servers {
-		if srv.Enabled {
+		if srv.TrackingEnabled {
 			enabledSet[srv.ID] = true
 		}
 	}

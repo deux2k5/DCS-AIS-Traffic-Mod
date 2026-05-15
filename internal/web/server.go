@@ -42,44 +42,46 @@ type ServerListResponse struct {
 // the dashboard needs so the frontend can poll a single endpoint per cycle
 // instead of separate list + per-server status calls.
 type ServerSummary struct {
-	ID             string              `json:"id"`
-	Name           string              `json:"name"`
-	Enabled        bool                `json:"enabled"`
-	HookPort       int                 `json:"hookPort"`
-	HookConnected  bool                `json:"hookConnected"`
-	Theatre        string              `json:"theatre"`
-	ShipCount      int                 `json:"shipCount"`
-	SpawnedCount   int                 `json:"spawnedCount"`
-	PendingCount   int                 `json:"pendingCount"`
-	ModelsLoaded   int                 `json:"modelsLoaded"`
-	HookDeployed   bool                `json:"hookDeployed"`
-	SavedGamesPath string              `json:"savedGamesPath"`
-	MaxShips       int                 `json:"maxShips"`
-	UpdateSeconds  int                 `json:"updateSeconds"`
-	StaleMinutes   int                 `json:"staleMinutes"`
-	Categories     map[string]int      `json:"categories"`
-	Filters        config.FilterConfig `json:"filters"`
+	ID              string              `json:"id"`
+	Name            string              `json:"name"`
+	TrackingEnabled bool                `json:"trackingEnabled"`
+	SpawnEnabled    bool                `json:"spawnEnabled"`
+	HookPort        int                 `json:"hookPort"`
+	HookConnected   bool                `json:"hookConnected"`
+	Theatre         string              `json:"theatre"`
+	ShipCount       int                 `json:"shipCount"`
+	SpawnedCount    int                 `json:"spawnedCount"`
+	PendingCount    int                 `json:"pendingCount"`
+	ModelsLoaded    int                 `json:"modelsLoaded"`
+	HookDeployed    bool                `json:"hookDeployed"`
+	SavedGamesPath  string              `json:"savedGamesPath"`
+	MaxShips        int                 `json:"maxShips"`
+	UpdateSeconds   int                 `json:"updateSeconds"`
+	StaleMinutes    int                 `json:"staleMinutes"`
+	Categories      map[string]int      `json:"categories"`
+	Filters         config.FilterConfig `json:"filters"`
 }
 
 // ServerStatusResponse is returned by GET /api/servers/{id}/status.
 type ServerStatusResponse struct {
-	ID             string         `json:"id"`
-	Name           string         `json:"name"`
-	Enabled        bool           `json:"enabled"`
-	Theatre        string         `json:"theatre"`
-	ShipCount      int            `json:"shipCount"`
-	SpawnedCount   int            `json:"spawnedCount"`
-	PendingCount   int            `json:"pendingCount"`
-	ModelsLoaded   int            `json:"modelsLoaded"`
-	HookConnected  bool           `json:"hookConnected"`
-	HookDeployed   bool           `json:"hookDeployed"`
-	SavedGamesPath string         `json:"savedGamesPath"`
-	HookPort       int            `json:"hookPort"`
-	MaxShips       int            `json:"maxShips"`
-	UpdateSeconds  int            `json:"updateSeconds"`
-	StaleMinutes   int            `json:"staleMinutes"`
-	Categories     map[string]int `json:"categories"`
-	Filters        config.FilterConfig `json:"filters"`
+	ID              string              `json:"id"`
+	Name            string              `json:"name"`
+	TrackingEnabled bool                `json:"trackingEnabled"`
+	SpawnEnabled    bool                `json:"spawnEnabled"`
+	Theatre         string              `json:"theatre"`
+	ShipCount       int                 `json:"shipCount"`
+	SpawnedCount    int                 `json:"spawnedCount"`
+	PendingCount    int                 `json:"pendingCount"`
+	ModelsLoaded    int                 `json:"modelsLoaded"`
+	HookConnected   bool                `json:"hookConnected"`
+	HookDeployed    bool                `json:"hookDeployed"`
+	SavedGamesPath  string              `json:"savedGamesPath"`
+	HookPort        int                 `json:"hookPort"`
+	MaxShips        int                 `json:"maxShips"`
+	UpdateSeconds   int                 `json:"updateSeconds"`
+	StaleMinutes    int                 `json:"staleMinutes"`
+	Categories      map[string]int      `json:"categories"`
+	Filters         config.FilterConfig `json:"filters"`
 }
 
 // AddServerRequest is the body of POST /api/servers.
@@ -89,8 +91,10 @@ type AddServerRequest struct {
 }
 
 // ToggleRequest is the body of POST /api/servers/{id}/toggle.
+// Uses pointers so the handler can distinguish "not sent" from "set to false".
 type ToggleRequest struct {
-	Enabled bool `json:"enabled"`
+	TrackingEnabled *bool `json:"trackingEnabled,omitempty"`
+	SpawnEnabled    *bool `json:"spawnEnabled,omitempty"`
 }
 
 // --------------------------------------------------------------------------
@@ -321,15 +325,16 @@ func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
 	for _, srv := range servers {
 		inst := s.mgr.Instance(srv.ID)
 		summary := ServerSummary{
-			ID:             srv.ID,
-			Name:           srv.Name,
-			Enabled:        srv.Enabled,
-			HookPort:       srv.HookPort,
-			SavedGamesPath: srv.SavedGamesPath,
-			MaxShips:       srv.MaxShips,
-			UpdateSeconds:  srv.UpdateSeconds,
-			StaleMinutes:   srv.StaleMinutes,
-			Filters:        srv.Filters,
+			ID:              srv.ID,
+			Name:            srv.Name,
+			TrackingEnabled: srv.TrackingEnabled,
+			SpawnEnabled:    srv.SpawnEnabled,
+			HookPort:        srv.HookPort,
+			SavedGamesPath:  srv.SavedGamesPath,
+			MaxShips:        srv.MaxShips,
+			UpdateSeconds:   srv.UpdateSeconds,
+			StaleMinutes:    srv.StaleMinutes,
+			Filters:         srv.Filters,
 		}
 		if inst != nil {
 			summary.HookConnected = inst.DCSServer.IsConnected()
@@ -443,15 +448,16 @@ func (s *Server) handleServerStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := ServerStatusResponse{
-		ID:             srv.ID,
-		Name:           srv.Name,
-		Enabled:        srv.Enabled,
-		SavedGamesPath: srv.SavedGamesPath,
-		HookPort:       srv.HookPort,
-		MaxShips:       srv.MaxShips,
-		UpdateSeconds:  srv.UpdateSeconds,
-		StaleMinutes:   srv.StaleMinutes,
-		Filters:        srv.Filters,
+		ID:              srv.ID,
+		Name:            srv.Name,
+		TrackingEnabled: srv.TrackingEnabled,
+		SpawnEnabled:    srv.SpawnEnabled,
+		SavedGamesPath:  srv.SavedGamesPath,
+		HookPort:        srv.HookPort,
+		MaxShips:        srv.MaxShips,
+		UpdateSeconds:   srv.UpdateSeconds,
+		StaleMinutes:    srv.StaleMinutes,
+		Filters:         srv.Filters,
 	}
 	s.cfg.RUnlock()
 
@@ -494,20 +500,27 @@ func (s *Server) handleServerToggle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inst.Coordinator.Toggle(req.Enabled)
-
-	// Persist enabled state to config.
-	s.cfg.Lock()
-	if srv := s.cfg.ServerByID(id); srv != nil {
-		srv.Enabled = req.Enabled
+	// Coordinator methods handle config persistence internally.
+	if req.TrackingEnabled != nil {
+		inst.Coordinator.ToggleTracking(*req.TrackingEnabled)
 	}
-	s.cfg.Unlock()
-	s.cfg.Save()
+	if req.SpawnEnabled != nil {
+		inst.Coordinator.ToggleSpawning(*req.SpawnEnabled)
+	}
 
-	// Refresh AIS since enabled/disabled affects which theatres are active.
+	// Refresh AIS since tracking state affects which theatres are active.
 	s.mgr.RefreshAIS()
 
-	writeJSON(w, map[string]bool{"enabled": req.Enabled})
+	// Return current state.
+	s.cfg.RLock()
+	srv := s.cfg.ServerByID(id)
+	resp := map[string]bool{
+		"trackingEnabled": srv.TrackingEnabled,
+		"spawnEnabled":    srv.SpawnEnabled,
+	}
+	s.cfg.RUnlock()
+
+	writeJSON(w, resp)
 }
 
 func (s *Server) handleServerFilters(w http.ResponseWriter, r *http.Request) {

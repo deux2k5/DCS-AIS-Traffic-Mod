@@ -4,8 +4,8 @@
   // ------ DOM refs ------
   var aisDot = document.getElementById("ais-dot");
   var hookDot = document.getElementById("hook-dot");
-  var enableToggle = document.getElementById("enable-toggle");
-  var toggleText = document.getElementById("toggle-text");
+  var trackingToggle = document.getElementById("tracking-toggle");
+  var spawnToggle = document.getElementById("spawn-toggle");
   var theatreValue = document.getElementById("theatre-value");
   var modelsValue = document.getElementById("models-value");
   var shipCount = document.getElementById("ship-count");
@@ -42,7 +42,8 @@
   var modalError = document.getElementById("modal-error");
   var modalBrowse = document.getElementById("modal-browse");
 
-  var ignoreNextToggle = false;
+  var ignoreNextTracking = false;
+  var ignoreNextSpawn = false;
   var currentServerId = null;
   var serverList = [];
 
@@ -263,10 +264,11 @@
   // ------ Per-server panel update (from server list data, no extra request) ------
   function updateServerPanel(data) {
     // Build a fingerprint of all panel-relevant fields. Skip DOM writes if nothing changed.
-    var panelFP = data.hookConnected + "|" + data.enabled + "|" + (data.theatre || "") + "|" +
-      data.modelsLoaded + "|" + data.shipCount + "|" + data.spawnedCount + "|" + data.pendingCount + "|" +
-      data.maxShips + "|" + data.updateSeconds + "|" + (data.savedGamesPath || "") + "|" +
-      data.hookDeployed + "|" + (data.name || "") + "|" + JSON.stringify(data.categories || {}) + "|" +
+    var panelFP = data.hookConnected + "|" + data.trackingEnabled + "|" + data.spawnEnabled + "|" +
+      (data.theatre || "") + "|" + data.modelsLoaded + "|" + data.shipCount + "|" +
+      data.spawnedCount + "|" + data.pendingCount + "|" + data.maxShips + "|" +
+      data.updateSeconds + "|" + (data.savedGamesPath || "") + "|" + data.hookDeployed + "|" +
+      (data.name || "") + "|" + JSON.stringify(data.categories || {}) + "|" +
       JSON.stringify(data.filters || {});
 
     if (panelFP === prevPanelJSON) return;
@@ -274,11 +276,13 @@
 
     hookDot.className = data.hookConnected ? "dot connected" : "dot";
 
-    ignoreNextToggle = true;
-    enableToggle.checked = data.enabled;
-    toggleText.textContent = data.enabled ? "Enabled" : "Disabled";
-    toggleText.className = data.enabled ? "toggle-text active" : "toggle-text";
-    ignoreNextToggle = false;
+    ignoreNextTracking = true;
+    trackingToggle.checked = data.trackingEnabled;
+    ignoreNextTracking = false;
+
+    ignoreNextSpawn = true;
+    spawnToggle.checked = data.spawnEnabled;
+    ignoreNextSpawn = false;
 
     theatreValue.textContent = data.theatre || "--";
     modelsValue.textContent = data.modelsLoaded > 0 ? data.modelsLoaded : "--";
@@ -432,17 +436,39 @@
     return Math.floor(diff / 3600) + "h";
   }
 
-  // ------ Event handlers: toggle ------
-  enableToggle.addEventListener("change", function () {
-    if (ignoreNextToggle || !currentServerId) return;
-    var enabled = enableToggle.checked;
-    toggleText.textContent = enabled ? "Enabled" : "Disabled";
-    toggleText.className = enabled ? "toggle-text active" : "toggle-text";
+  // ------ Event handlers: toggles ------
+  trackingToggle.addEventListener("change", function () {
+    if (ignoreNextTracking || !currentServerId) return;
+    var on = trackingToggle.checked;
+
+    // Turning tracking off also disables spawning in the UI immediately.
+    if (!on) {
+      ignoreNextSpawn = true;
+      spawnToggle.checked = false;
+      ignoreNextSpawn = false;
+    }
 
     fetch("/api/servers/" + currentServerId + "/toggle", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled: enabled })
+      body: JSON.stringify({ trackingEnabled: on })
+    }).then(function () {
+      prevPanelJSON = "";
+      fetchServers();
+    });
+  });
+
+  spawnToggle.addEventListener("change", function () {
+    if (ignoreNextSpawn || !currentServerId) return;
+    var on = spawnToggle.checked;
+
+    fetch("/api/servers/" + currentServerId + "/toggle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ spawnEnabled: on })
+    }).then(function () {
+      prevPanelJSON = "";
+      fetchServers();
     });
   });
 

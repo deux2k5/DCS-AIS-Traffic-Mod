@@ -23,6 +23,9 @@ AIS.TCP_HOST            = "127.0.0.1"
 AIS.TCP_PORT            = 18420
 AIS.POLL_INTERVAL       = 0.5   -- seconds between TCP reads
 AIS.RECONNECT_INTERVAL  = 5     -- seconds between reconnect attempts
+AIS.MAX_CMDS_PER_POLL   = 2     -- max expensive commands (spawn/remove/move) per poll
+AIS.MAX_REROUTES_PER_POLL = 4   -- max reroute commands per poll (cheaper than spawn)
+AIS.DEBUG               = false -- set true to enable per-command log lines
 
 -- ---------------------------------------------------------------------------
 -- State
@@ -30,11 +33,14 @@ AIS.RECONNECT_INTERVAL  = 5     -- seconds between reconnect attempts
 AIS.tcp              = nil      -- TCP socket handle
 AIS.connected        = false
 AIS.recvBuffer       = ""       -- incomplete data from TCP reads
+AIS.bufferOffset     = 1        -- read position in recvBuffer (avoids O(n^2) sub)
 AIS.lastPollTime     = 0
 AIS.lastReconnect    = 0
-AIS.trackedGroups    = {}       -- [groupName] = true
+AIS.trackedGroups    = {}       -- [groupName] = "group" | "static"
 AIS.theatre          = nil      -- current map name
 AIS.unitCounter      = 0        -- monotonic counter for unique unit IDs
+AIS.cmdQueue         = {}       -- pending commands not yet executed
+AIS.helpersInstalled = false    -- whether server-side helpers are loaded
 
 -- ---------------------------------------------------------------------------
 -- Logging helpers
@@ -51,6 +57,12 @@ local function logWarning(msg)
     log.write('AISTraffic', log.WARNING, msg)
 end
 
+local function logDebug(msg)
+    if AIS.DEBUG then
+        log.write('AISTraffic', log.INFO, msg)
+    end
+end
+
 -- ---------------------------------------------------------------------------
 -- TCP helpers
 -- ---------------------------------------------------------------------------
@@ -63,6 +75,7 @@ local function tcpDisconnect()
     end
     AIS.connected = false
     AIS.recvBuffer = ""
+    AIS.bufferOffset = 1
     logInfo("Disconnected from AIS backend")
 end
 
@@ -105,7 +118,7 @@ local function tcpConnect()
         return false
     end
 
-    tcp:settimeout(2) -- short blocking timeout for the connect handshake
+    tcp:settimeout(0.5) -- short timeout — 2s was too long for frame callbacks
     local ok, cerr = tcp:connect(AIS.TCP_HOST, AIS.TCP_PORT)
     if not ok then
         logError("TCP connect failed: " .. tostring(cerr))
@@ -114,9 +127,12 @@ local function tcpConnect()
     end
 
     tcp:settimeout(0) -- non-blocking from here on
+    tcp:setoption("tcp-nodelay", true) -- disable Nagle for lower latency
     AIS.tcp = tcp
     AIS.connected = true
     AIS.recvBuffer = ""
+    AIS.bufferOffset = 1
+    AIS.helpersInstalled = false
     logInfo("Connected to AIS backend")
 
     -- Detect theatre if we don't know it yet (e.g. hook loaded mid-mission)
@@ -134,33 +150,34 @@ local function tcpConnect()
     end
 
     -- Detect available ship models so the backend only uses installed ones.
-    local allModels = {
-        -- CAP Navy
-        "container_ship", "fishing_vessel", "trawler_ship", "diesel_trawler",
-        "lng_tanker", "ievoli_ivory",
-        "jr_more_tug", "jr_more_tug_helipad",
-        "yacht_ship", "yacht_helipad",
-        "akademik_cherskiy", "akademik_cherskiy_pipe_laying",
-        "kimedaka_skyicher", "old_vessel",
-        -- DCS base (TechWeaponPack)
-        "HandyWind", "Seawise_Giant", "La_Combattante_II", "BDK-775",
-        -- DCS base (SouthAtlanticAssets)
-        "HarborTug", "Ship_Tilde_Supply", "CastleClass_01", "leander-gun-ariadne",
-        -- Currenthill Assets Pack
-        "ALBATROS", "CHAP_Project22160",
-    }
-    local available = {}
-    for _, m in ipairs(allModels) do
-        local checkCode = string.format(
-            'local d = Unit.getDescByName("%s") if d then return "1" else return "0" end', m)
-        local rok, result = pcall(net.dostring_in, 'server', checkCode)
-        if rok and result == "1" then
+    -- Batched into a single dostring_in call for efficiency.
+    local checkCode = [[
+        local models = {
+            "container_ship", "fishing_vessel", "trawler_ship", "diesel_trawler",
+            "lng_tanker", "ievoli_ivory",
+            "jr_more_tug", "jr_more_tug_helipad",
+            "yacht_ship", "yacht_helipad",
+            "akademik_cherskiy", "akademik_cherskiy_pipe_laying",
+            "kimedaka_skyicher", "old_vessel",
+            "HandyWind", "Seawise_Giant", "La_Combattante_II", "BDK-775",
+            "HarborTug", "Ship_Tilde_Supply", "CastleClass_01", "leander-gun-ariadne",
+            "ALBATROS", "CHAP_Project22160",
+        }
+        local avail = {}
+        for _, m in ipairs(models) do
+            local d = Unit.getDescByName(m)
+            if d then avail[#avail + 1] = m end
+        end
+        return table.concat(avail, ",")
+    ]]
+
+    local rok, result = pcall(net.dostring_in, 'server', checkCode)
+    if rok and result and #result > 0 then
+        local available = {}
+        for m in string.gmatch(result, "([^,]+)") do
             available[#available + 1] = m
         end
-    end
-
-    if #available > 0 then
-        logInfo(string.format("Detected %d/%d ship models available", #available, #allModels))
+        logInfo(string.format("Detected %d ship models available", #available))
         tcpSend({ type = "models", models = available })
     end
 
@@ -168,6 +185,7 @@ local function tcpConnect()
 end
 
 --- Read available data from the socket, split on newlines, return complete lines.
+-- Uses offset tracking to avoid O(n^2) string.sub on large buffers.
 -- @return table of complete JSON strings (may be empty)
 local function tcpReadLines()
     local lines = {}
@@ -198,253 +216,156 @@ local function tcpReadLines()
         end
     end
 
-    -- Split buffer on newlines
+    -- Split buffer on newlines using offset to avoid repeated string.sub
     while true do
-        local nlPos = string.find(AIS.recvBuffer, "\n", 1, true)
+        local nlPos = string.find(AIS.recvBuffer, "\n", AIS.bufferOffset, true)
         if not nlPos then
             break
         end
-        local line = string.sub(AIS.recvBuffer, 1, nlPos - 1)
-        AIS.recvBuffer = string.sub(AIS.recvBuffer, nlPos + 1)
+        local line = string.sub(AIS.recvBuffer, AIS.bufferOffset, nlPos - 1)
+        AIS.bufferOffset = nlPos + 1
         if #line > 0 then
             lines[#lines + 1] = line
         end
+    end
+
+    -- Compact buffer when we've consumed most of it
+    if AIS.bufferOffset > 4096 then
+        AIS.recvBuffer = string.sub(AIS.recvBuffer, AIS.bufferOffset)
+        AIS.bufferOffset = 1
     end
 
     return lines
 end
 
 -- ---------------------------------------------------------------------------
--- DCS command execution helpers
+-- Server-side helper installation
 -- ---------------------------------------------------------------------------
 
---- Build the Lua code string that spawns a ship group via the server environment.
--- The ship is placed at its AIS position with a projected waypoint 20 km ahead
--- along its heading so it starts moving immediately.
--- Includes a water check: returns "LAND" if the position is on land.
--- @param cmd table with fields: groupName, unitType, lat, lon, heading, speed, name
--- @return string Lua code to execute inside server env
-local function buildSpawnCode(cmd)
-    AIS.unitCounter = AIS.unitCounter + 1
-    local unitId = AIS.unitCounter
+--- Install persistent helper functions in the DCS server environment once per
+--- mission. Calling compact helpers is much cheaper than compiling large code
+--- strings on every spawn/reroute.
+local function installHelpers()
+    if AIS.helpersInstalled then return true end
 
-    -- Sanitize strings that go into generated code
-    local groupName = string.gsub(cmd.groupName or "AIS_UNKNOWN", '["\\\n\r]', '_')
-    local unitName  = string.gsub(cmd.name or groupName, '["\\\n\r]', '_')
-    local unitType  = string.gsub(cmd.unitType or "dry_cargo_ship_2", '["\\\n\r]', '_')
-    local lat       = tonumber(cmd.lat) or 0
-    local lon       = tonumber(cmd.lon) or 0
-    local heading   = tonumber(cmd.heading) or 0
-    local speed     = tonumber(cmd.speed) or 0
+    local code = [[
+        if AIS_HELPERS then return "OK" end
+        AIS_HELPERS = true
 
-    -- Project a waypoint 20 km ahead along the heading so the ship moves on spawn
-    local projectDist = 20000 -- metres
+        function AIS_Spawn(lat, lon, hdg, spd, dist, groupName, unitName, unitType, unitId)
+            local pos = coord.LLtoLO(lat, lon, 0)
+            local surfType = land.getSurfaceType({x = pos.x, y = pos.z})
+            if surfType ~= 2 and surfType ~= 3 then return "LAND" end
 
-    local code = string.format([[
-        local pos = coord.LLtoLO(%f, %f, 0)
+            local wp2x = pos.x + dist * math.cos(hdg)
+            local wp2z = pos.z + dist * math.sin(hdg)
 
-        -- Water check: reject positions on land
-        local surfType = land.getSurfaceType({x = pos.x, y = pos.z})
-        if surfType ~= 2 and surfType ~= 3 then
-            return "LAND"
-        end
-
-        local hdg = %f
-        local spd = %f
-        local dist = %f
-
-        -- Projected waypoint ahead of the ship
-        local wp2x = pos.x + dist * math.cos(hdg)
-        local wp2z = pos.z + dist * math.sin(hdg)
-
-        local groupData = {
-            ["visible"] = true,
-            ["hidden"]  = false,
-            ["name"]    = "%s",
-            ["task"]    = "Ground Nothing",
-            ["uncontrollable"] = true,
-            ["route"] = {
-                ["points"] = {
-                    [1] = {
-                        ["x"]      = pos.x,
-                        ["y"]      = pos.z,
-                        ["alt"]    = 0,
-                        ["type"]   = "Turning Point",
-                        ["action"] = "Turning Point",
-                        ["speed"]  = spd,
-                    },
-                    [2] = {
-                        ["x"]      = wp2x,
-                        ["y"]      = wp2z,
-                        ["alt"]    = 0,
-                        ["type"]   = "Turning Point",
-                        ["action"] = "Turning Point",
-                        ["speed"]  = spd,
-                    },
-                },
-            },
-            ["units"] = {
-                [1] = {
-                    ["name"]    = "%s",
-                    ["type"]    = "%s",
-                    ["x"]       = pos.x,
-                    ["y"]       = pos.z,
-                    ["heading"] = hdg,
-                    ["skill"]   = "Average",
-                    ["unitId"]  = %d,
-                },
-            },
-        }
-        local ok, err = pcall(function()
-            coalition.addGroup(country.id.UN_PEACEKEEPERS, Group.Category.SHIP, groupData)
-        end)
-        if not ok then
-            ok, err = pcall(function()
-                coalition.addGroup(82, Group.Category.SHIP, groupData)
+            local groupData = {
+                visible = true, hidden = false,
+                name = groupName, task = "Ground Nothing", uncontrollable = true,
+                route = { points = {
+                    [1] = { x = pos.x, y = pos.z, alt = 0, type = "Turning Point", action = "Turning Point", speed = spd },
+                    [2] = { x = wp2x, y = wp2z, alt = 0, type = "Turning Point", action = "Turning Point", speed = spd },
+                }},
+                units = { [1] = {
+                    name = unitName, type = unitType,
+                    x = pos.x, y = pos.z, heading = hdg, skill = "Average", unitId = unitId,
+                }},
+            }
+            local ok, err = pcall(function()
+                coalition.addGroup(country.id.UN_PEACEKEEPERS, Group.Category.SHIP, groupData)
             end)
-        end
-        if not ok then
-            return "ERROR:" .. tostring(err)
-        end
-        return "OK"
-    ]], lat, lon, heading, speed, projectDist,
-       groupName, unitName, unitType, unitId)
-
-    return code
-end
-
---- Build Lua code to spawn a static object (no AI, for anchored ships).
--- Also includes the water check.
--- @param cmd table with fields: groupName, unitType, lat, lon, heading, name
--- @return string Lua code
-local function buildStaticSpawnCode(cmd)
-    local groupName = string.gsub(cmd.groupName or "AIS_UNKNOWN", '["\\\n\r]', '_')
-    local unitType  = string.gsub(cmd.unitType or "dry_cargo_ship_2", '["\\\n\r]', '_')
-    local lat       = tonumber(cmd.lat) or 0
-    local lon       = tonumber(cmd.lon) or 0
-    local heading   = tonumber(cmd.heading) or 0
-
-    return string.format([[
-        local pos = coord.LLtoLO(%f, %f, 0)
-
-        -- Water check: reject positions on land
-        local surfType = land.getSurfaceType({x = pos.x, y = pos.z})
-        if surfType ~= 2 and surfType ~= 3 then
-            return "LAND"
-        end
-
-        local staticData = {
-            ["name"]    = "%s",
-            ["type"]    = "%s",
-            ["x"]       = pos.x,
-            ["y"]       = pos.z,
-            ["heading"] = %f,
-            ["dead"]    = false,
-        }
-        local ok, err = pcall(function()
-            coalition.addStaticObject(country.id.UN_PEACEKEEPERS, staticData)
-        end)
-        if not ok then
-            ok, err = pcall(function()
-                coalition.addStaticObject(82, staticData)
-            end)
-        end
-        if not ok then
-            return "ERROR:" .. tostring(err)
-        end
-        return "OK"
-    ]], lat, lon, groupName, unitType, heading)
-end
-
---- Build Lua code to smoothly reroute a ship to a new position by pushing a
---- new waypoint via the group controller. The ship turns and sails there
---- instead of teleporting.
--- @param cmd table with fields: groupName, lat, lon, heading, speed
--- @return string Lua code
-local function buildRerouteCode(cmd)
-    local groupName = string.gsub(cmd.groupName or "", '["\\\n\r]', '_')
-    local lat       = tonumber(cmd.lat) or 0
-    local lon       = tonumber(cmd.lon) or 0
-    local heading   = tonumber(cmd.heading) or 0
-    local speed     = tonumber(cmd.speed) or 0
-    local projectDist = 20000
-
-    return string.format([[
-        local grp = Group.getByName("%s")
-        if not grp then return "NO_GROUP" end
-        local unit = grp:getUnit(1)
-        if not unit then return "NO_UNIT" end
-
-        local curPos = unit:getPoint()
-        local tgtPos = coord.LLtoLO(%f, %f, 0)
-        local hdg = %f
-        local spd = %f
-        local dist = %f
-
-        -- Waypoint beyond the target so the ship keeps sailing through
-        local wp3x = tgtPos.x + dist * math.cos(hdg)
-        local wp3z = tgtPos.z + dist * math.sin(hdg)
-
-        local route = {
-            [1] = {
-                ["x"]      = curPos.x,
-                ["y"]      = curPos.z,
-                ["alt"]    = 0,
-                ["speed"]  = spd,
-                ["type"]   = "Turning Point",
-                ["action"] = "Turning Point",
-            },
-            [2] = {
-                ["x"]      = tgtPos.x,
-                ["y"]      = tgtPos.z,
-                ["alt"]    = 0,
-                ["speed"]  = spd,
-                ["type"]   = "Turning Point",
-                ["action"] = "Turning Point",
-            },
-            [3] = {
-                ["x"]      = wp3x,
-                ["y"]      = wp3z,
-                ["alt"]    = 0,
-                ["speed"]  = spd,
-                ["type"]   = "Turning Point",
-                ["action"] = "Turning Point",
-            },
-        }
-
-        local ok, err = pcall(function()
-            local controller = grp:getController()
-            controller:setTask({
-                id = "Mission",
-                params = { route = { points = route } },
-            })
-        end)
-        if not ok then
-            return "ERROR:" .. tostring(err)
-        end
-        return "OK"
-    ]], groupName, lat, lon, heading, speed, projectDist)
-end
-
---- Build Lua code to destroy a group by name.
--- @param groupName string
--- @return string Lua code
-local function buildDestroyCode(groupName)
-    local safe = string.gsub(groupName, '["\\\n\r]', '_')
-    return string.format([[
-        local grp = Group.getByName("%s")
-        if grp then
-            grp:destroy()
+            if not ok then
+                ok, err = pcall(function()
+                    coalition.addGroup(82, Group.Category.SHIP, groupData)
+                end)
+            end
+            if not ok then return "ERROR:" .. tostring(err) end
             return "OK"
         end
-        local st = StaticObject.getByName("%s")
-        if st then
-            st:destroy()
+
+        function AIS_SpawnStatic(lat, lon, hdg, groupName, unitType)
+            local pos = coord.LLtoLO(lat, lon, 0)
+            local surfType = land.getSurfaceType({x = pos.x, y = pos.z})
+            if surfType ~= 2 and surfType ~= 3 then return "LAND" end
+
+            local staticData = {
+                name = groupName, type = unitType,
+                x = pos.x, y = pos.z, heading = hdg, dead = false,
+            }
+            local ok, err = pcall(function()
+                coalition.addStaticObject(country.id.UN_PEACEKEEPERS, staticData)
+            end)
+            if not ok then
+                ok, err = pcall(function()
+                    coalition.addStaticObject(82, staticData)
+                end)
+            end
+            if not ok then return "ERROR:" .. tostring(err) end
             return "OK"
         end
-        return "NOT_FOUND"
-    ]], safe, safe)
+
+        function AIS_Reroute(groupName, lat, lon, hdg, spd, dist)
+            local grp = Group.getByName(groupName)
+            if not grp then return "NO_GROUP" end
+            local unit = grp:getUnit(1)
+            if not unit then return "NO_UNIT" end
+
+            local curPos = unit:getPoint()
+            local tgtPos = coord.LLtoLO(lat, lon, 0)
+            local wp3x = tgtPos.x + dist * math.cos(hdg)
+            local wp3z = tgtPos.z + dist * math.sin(hdg)
+
+            local route = {
+                [1] = { x = curPos.x, y = curPos.z, alt = 0, speed = spd, type = "Turning Point", action = "Turning Point" },
+                [2] = { x = tgtPos.x, y = tgtPos.z, alt = 0, speed = spd, type = "Turning Point", action = "Turning Point" },
+                [3] = { x = wp3x, y = wp3z, alt = 0, speed = spd, type = "Turning Point", action = "Turning Point" },
+            }
+
+            local ok, err = pcall(function()
+                local controller = grp:getController()
+                controller:setTask({ id = "Mission", params = { route = { points = route } } })
+            end)
+            if not ok then return "ERROR:" .. tostring(err) end
+            return "OK"
+        end
+
+        function AIS_Destroy(groupName)
+            local grp = Group.getByName(groupName)
+            if grp then grp:destroy() return "OK" end
+            local st = StaticObject.getByName(groupName)
+            if st then st:destroy() return "OK" end
+            return "NOT_FOUND"
+        end
+
+        function AIS_DestroyBatch(names)
+            local count = 0
+            for _, name in ipairs(names) do
+                local grp = Group.getByName(name)
+                if grp then grp:destroy() count = count + 1
+                else
+                    local st = StaticObject.getByName(name)
+                    if st then st:destroy() count = count + 1 end
+                end
+            end
+            return tostring(count)
+        end
+    ]]
+
+    local ok, result = pcall(net.dostring_in, 'server', code)
+    if not ok then
+        logError("Failed to install helpers: " .. tostring(result))
+        return false
+    end
+
+    AIS.helpersInstalled = true
+    logInfo("Server-side helpers installed")
+    return true
 end
+
+-- ---------------------------------------------------------------------------
+-- DCS command execution helpers (using persistent server functions)
+-- ---------------------------------------------------------------------------
 
 --- Execute Lua code inside the DCS server scripting environment.
 -- @param code string  Lua source to run
@@ -468,21 +389,37 @@ local function handleSpawn(cmd)
         return
     end
 
-    local isStatic = cmd.static == true
-    local label = isStatic and "static" or "group"
-
-    logInfo(string.format("Spawning %s %s (%s) at %.4f, %.4f hdg=%.2f spd=%.1f",
-        label, cmd.groupName, cmd.unitType or "?", cmd.lat or 0, cmd.lon or 0,
-        cmd.heading or 0, cmd.speed or 0))
-
-    local code
-    if isStatic then
-        code = buildStaticSpawnCode(cmd)
-    else
-        code = buildSpawnCode(cmd)
+    if not installHelpers() then
+        logWarning("Helpers not installed, deferring spawn")
+        return
     end
 
-    local result, err = serverExec(code)
+    local isStatic = cmd.static == true
+
+    logDebug(string.format("Spawning %s %s (%s) at %.4f, %.4f",
+        isStatic and "static" or "group", cmd.groupName, cmd.unitType or "?",
+        cmd.lat or 0, cmd.lon or 0))
+
+    local result, err
+
+    if isStatic then
+        local code = string.format(
+            'return AIS_SpawnStatic(%.6f, %.6f, %.4f, "%s", "%s")',
+            cmd.lat or 0, cmd.lon or 0, cmd.heading or 0,
+            string.gsub(cmd.groupName, '["\\\n\r]', '_'),
+            string.gsub(cmd.unitType or "dry_cargo_ship_2", '["\\\n\r]', '_'))
+        result, err = serverExec(code)
+    else
+        AIS.unitCounter = AIS.unitCounter + 1
+        local code = string.format(
+            'return AIS_Spawn(%.6f, %.6f, %.4f, %.4f, 20000, "%s", "%s", "%s", %d)',
+            cmd.lat or 0, cmd.lon or 0, cmd.heading or 0, cmd.speed or 0,
+            string.gsub(cmd.groupName or "AIS_UNKNOWN", '["\\\n\r]', '_'),
+            string.gsub(cmd.name or cmd.groupName or "AIS_UNKNOWN", '["\\\n\r]', '_'),
+            string.gsub(cmd.unitType or "dry_cargo_ship_2", '["\\\n\r]', '_'),
+            AIS.unitCounter)
+        result, err = serverExec(code)
+    end
 
     if err then
         logError("Spawn exec error for " .. cmd.groupName .. ": " .. err)
@@ -491,7 +428,8 @@ local function handleSpawn(cmd)
     end
 
     if result == "LAND" then
-        logInfo("Rejected " .. cmd.groupName .. " (on land)")
+        logDebug("Rejected " .. cmd.groupName .. " (on land)")
+        tcpSend({ type = "reject", reason = "land", groupName = cmd.groupName })
         return
     end
 
@@ -503,7 +441,7 @@ local function handleSpawn(cmd)
     end
 
     AIS.trackedGroups[cmd.groupName] = isStatic and "static" or "group"
-    logInfo("Spawned " .. label .. " " .. cmd.groupName)
+    logDebug("Spawned " .. (isStatic and "static" or "group") .. " " .. cmd.groupName)
 end
 
 local function handleRemove(cmd)
@@ -512,9 +450,12 @@ local function handleRemove(cmd)
         return
     end
 
-    logInfo("Removing group " .. cmd.groupName)
+    if not installHelpers() then return end
 
-    local code = buildDestroyCode(cmd.groupName)
+    logDebug("Removing " .. cmd.groupName)
+
+    local code = string.format('return AIS_Destroy("%s")',
+        string.gsub(cmd.groupName, '["\\\n\r]', '_'))
     local result, err = serverExec(code)
 
     if err then
@@ -524,11 +465,36 @@ local function handleRemove(cmd)
     AIS.trackedGroups[cmd.groupName] = nil
 end
 
+local function handleMove(cmd)
+    if not cmd.groupName then
+        logError("move command missing groupName")
+        return
+    end
+
+    logDebug(string.format("Moving %s to %.4f, %.4f",
+        cmd.groupName, cmd.lat or 0, cmd.lon or 0))
+
+    -- Destroy existing group first
+    if AIS.trackedGroups[cmd.groupName] then
+        if installHelpers() then
+            local code = string.format('return AIS_Destroy("%s")',
+                string.gsub(cmd.groupName, '["\\\n\r]', '_'))
+            serverExec(code)
+        end
+        AIS.trackedGroups[cmd.groupName] = nil
+    end
+
+    -- Spawn at new position
+    handleSpawn(cmd)
+end
+
 local function handleReroute(cmd)
     if not cmd.groupName then
         logError("reroute command missing groupName")
         return
     end
+
+    if not installHelpers() then return end
 
     local tracked = AIS.trackedGroups[cmd.groupName]
     if not tracked then
@@ -537,16 +503,18 @@ local function handleReroute(cmd)
         return
     end
 
-    -- Static objects can't be rerouted — they just sit there.
-    -- The Go coordinator handles static→group conversion by sending remove+spawn.
+    -- Static objects can't be rerouted.
     if tracked == "static" then
         return
     end
 
-    logInfo(string.format("Rerouting group %s to %.4f, %.4f hdg=%.2f spd=%.1f",
-        cmd.groupName, cmd.lat or 0, cmd.lon or 0, cmd.heading or 0, cmd.speed or 0))
+    logDebug(string.format("Rerouting %s to %.4f, %.4f",
+        cmd.groupName, cmd.lat or 0, cmd.lon or 0))
 
-    local code = buildRerouteCode(cmd)
+    local code = string.format(
+        'return AIS_Reroute("%s", %.6f, %.6f, %.4f, %.4f, 20000)',
+        string.gsub(cmd.groupName, '["\\\n\r]', '_'),
+        cmd.lat or 0, cmd.lon or 0, cmd.heading or 0, cmd.speed or 0)
     local result, err = serverExec(code)
 
     if err then
@@ -555,7 +523,7 @@ local function handleReroute(cmd)
     end
 
     if result == "NO_GROUP" or result == "NO_UNIT" then
-        logWarning("Reroute: group " .. cmd.groupName .. " not found in DCS, re-spawning")
+        logWarning("Reroute: " .. cmd.groupName .. " not found in DCS, re-spawning")
         AIS.trackedGroups[cmd.groupName] = nil
         handleSpawn(cmd)
         return
@@ -567,69 +535,72 @@ local function handleReroute(cmd)
         return
     end
 
-    logInfo("Rerouted " .. cmd.groupName)
-end
-
-local function handleMove(cmd)
-    if not cmd.groupName then
-        logError("move command missing groupName")
-        return
-    end
-
-    logInfo(string.format("Moving group %s to %.4f, %.4f",
-        cmd.groupName, cmd.lat or 0, cmd.lon or 0))
-
-    -- Destroy existing group first
-    if AIS.trackedGroups[cmd.groupName] then
-        local code = buildDestroyCode(cmd.groupName)
-        local _, err = serverExec(code)
-        if err then
-            logWarning("Move: failed to destroy old group " .. cmd.groupName .. ": " .. err)
-        end
-        AIS.trackedGroups[cmd.groupName] = nil
-    end
-
-    -- Spawn at new position
-    handleSpawn(cmd)
+    logDebug("Rerouted " .. cmd.groupName)
 end
 
 local function handleClear()
     logInfo("Clearing all tracked AIS groups")
-    for groupName, _ in pairs(AIS.trackedGroups) do
-        local code = buildDestroyCode(groupName)
-        local _, err = serverExec(code)
-        if err then
-            logWarning("Clear: failed to destroy " .. groupName .. ": " .. err)
+
+    if installHelpers() then
+        -- Batch destroy in chunks to avoid frame stalls
+        local names = {}
+        for groupName, _ in pairs(AIS.trackedGroups) do
+            names[#names + 1] = groupName
+        end
+
+        -- Build a Lua table literal for batch destroy
+        if #names > 0 then
+            local parts = {}
+            for i, name in ipairs(names) do
+                parts[i] = '"' .. string.gsub(name, '["\\\n\r]', '_') .. '"'
+            end
+            local code = 'return AIS_DestroyBatch({' .. table.concat(parts, ',') .. '})'
+            local result, err = serverExec(code)
+            if err then
+                logWarning("Batch clear error: " .. err)
+            else
+                logInfo("Batch cleared " .. tostring(result) .. " objects")
+            end
         end
     end
+
     AIS.trackedGroups = {}
+    AIS.cmdQueue = {}
     logInfo("All AIS groups cleared")
 end
 
---- Dispatch a parsed command table.
+--- Dispatch a parsed command table. Returns true if it was an expensive
+--- command (spawn/remove/move), false if cheap (reroute) or instant (clear).
 local function dispatchCommand(cmd)
     if not cmd or not cmd.cmd then
         logWarning("Received message with no 'cmd' field")
-        return
+        return false
     end
 
     if cmd.cmd == "spawn" then
         handleSpawn(cmd)
+        return true
     elseif cmd.cmd == "remove" then
         handleRemove(cmd)
+        return true
     elseif cmd.cmd == "reroute" then
         handleReroute(cmd)
+        return false -- reroute is cheaper, tracked separately
     elseif cmd.cmd == "move" then
         handleMove(cmd)
+        return true
     elseif cmd.cmd == "clear" then
         handleClear()
+        return false
     else
         logWarning("Unknown command: " .. tostring(cmd.cmd))
+        return false
     end
 end
 
 -- ---------------------------------------------------------------------------
 -- Main poll loop (called from onSimulationFrame, throttled)
+-- Rate-limits expensive DCS operations to avoid frame stalls.
 -- ---------------------------------------------------------------------------
 
 local function poll()
@@ -639,15 +610,52 @@ local function poll()
         return
     end
 
-    -- Read and process lines
+    -- Read new lines from TCP and add to command queue
     local lines = tcpReadLines()
     for _, line in ipairs(lines) do
         local ok, cmd = pcall(JSON.decode, JSON, line)
         if ok and cmd then
-            dispatchCommand(cmd)
+            AIS.cmdQueue[#AIS.cmdQueue + 1] = cmd
         else
-            logError("Failed to decode JSON: " .. tostring(cmd) .. " | raw: " .. line)
+            logError("Failed to decode JSON: " .. tostring(cmd))
         end
+    end
+
+    -- Process queued commands with per-frame budget
+    local expensiveCount = 0
+    local rerouteCount = 0
+    local remaining = {}
+
+    for _, cmd in ipairs(AIS.cmdQueue) do
+        -- Clear commands execute immediately regardless of budget
+        if cmd.cmd == "clear" then
+            dispatchCommand(cmd)
+            -- Wipe any over-budget commands already deferred — they belong
+            -- to the pre-clear state and must not be restored afterwards.
+            remaining = {}
+        elseif cmd.cmd == "reroute" then
+            if rerouteCount < AIS.MAX_REROUTES_PER_POLL then
+                dispatchCommand(cmd)
+                rerouteCount = rerouteCount + 1
+            else
+                remaining[#remaining + 1] = cmd
+            end
+        else
+            -- spawn, remove, move are expensive
+            if expensiveCount < AIS.MAX_CMDS_PER_POLL then
+                dispatchCommand(cmd)
+                expensiveCount = expensiveCount + 1
+            else
+                remaining[#remaining + 1] = cmd
+            end
+        end
+    end
+
+    AIS.cmdQueue = remaining
+
+    -- Log queue depth periodically if backing up
+    if #AIS.cmdQueue > 10 then
+        logWarning(string.format("Command queue backing up: %d pending", #AIS.cmdQueue))
     end
 end
 
@@ -656,11 +664,31 @@ end
 -- ---------------------------------------------------------------------------
 
 local function destroyAllTracked()
-    for groupName, _ in pairs(AIS.trackedGroups) do
-        pcall(function()
-            local code = buildDestroyCode(groupName)
-            serverExec(code)
-        end)
+    if installHelpers() then
+        local names = {}
+        for groupName, _ in pairs(AIS.trackedGroups) do
+            names[#names + 1] = groupName
+        end
+        if #names > 0 then
+            local parts = {}
+            for i, name in ipairs(names) do
+                parts[i] = '"' .. string.gsub(name, '["\\\n\r]', '_') .. '"'
+            end
+            local code = 'return AIS_DestroyBatch({' .. table.concat(parts, ',') .. '})'
+            pcall(serverExec, code)
+        end
+    else
+        for groupName, _ in pairs(AIS.trackedGroups) do
+            pcall(function()
+                local safe = string.gsub(groupName, '["\\\n\r]', '_')
+                serverExec(string.format([[
+                    local grp = Group.getByName("%s")
+                    if grp then grp:destroy() end
+                    local st = StaticObject.getByName("%s")
+                    if st then st:destroy() end
+                ]], safe, safe))
+            end)
+        end
     end
     AIS.trackedGroups = {}
 end
@@ -705,6 +733,8 @@ function callbacks.onMissionLoadEnd()
     AIS.unitCounter = 0
     AIS.lastPollTime = 0
     AIS.lastReconnect = 0
+    AIS.cmdQueue = {}
+    AIS.helpersInstalled = false
 
     -- Connect (or reconnect) to backend
     tcpConnect()
@@ -724,6 +754,8 @@ function callbacks.onSimulationStop()
     AIS.unitCounter = 0
     AIS.lastPollTime = 0
     AIS.lastReconnect = 0
+    AIS.cmdQueue = {}
+    AIS.helpersInstalled = false
 end
 
 -- ---------------------------------------------------------------------------

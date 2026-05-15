@@ -24,6 +24,10 @@ const (
 	StateRemoving                  // Removal sent, awaiting cleanup.
 )
 
+// Minimum interval between reroutes for the same ship, to avoid command churn
+// from AIS heading jitter.
+const minRerouteInterval = 15 * time.Second
+
 // TrackedShip holds all data for one tracked vessel.
 type TrackedShip struct {
 	MMSI        int       `json:"mmsi"`
@@ -37,13 +41,14 @@ type TrackedShip struct {
 	Sog         float64   `json:"sog"`     // knots
 	Length      int       `json:"length"`  // metres (A+B from AIS)
 	Beam        int       `json:"beam"`    // metres (C+D from AIS)
-	State      ShipState `json:"state"`
-	LastSeen   time.Time `json:"lastSeen"`
-	SpawnedLat float64   `json:"-"`
-	SpawnedLon float64   `json:"-"`
-	SpawnedHdg float64   `json:"-"`
-	GroupName  string    `json:"-"` // frozen at spawn time so reroute/remove work
-	IsStatic   bool      `json:"-"` // spawned as static object (no AI)
+	State       ShipState `json:"state"`
+	LastSeen    time.Time `json:"lastSeen"`
+	SpawnedLat  float64   `json:"-"`
+	SpawnedLon  float64   `json:"-"`
+	SpawnedHdg  float64   `json:"-"`
+	GroupName   string    `json:"-"` // frozen at spawn time so reroute/remove work
+	IsStatic    bool      `json:"-"` // spawned as static object (no AI)
+	LastReroute time.Time `json:"-"` // cooldown to prevent reroute churn
 }
 
 func (s ShipState) String() string {
@@ -195,7 +200,26 @@ func (c *Coordinator) OnHookMessage(msg dcscomm.InboundMessage) {
 	case "status":
 		log.Printf("[DCS] status: %d ships", msg.Ships)
 	case "error":
-		log.Printf("[DCS] error: %s", msg.Error)
+		log.Printf("[DCS] error: %s (group: %s)", msg.Error, msg.GroupName)
+	case "reject":
+		c.handleReject(msg)
+	}
+}
+
+// handleReject processes rejection feedback from the Lua hook (e.g. ship on land).
+func (c *Coordinator) handleReject(msg dcscomm.InboundMessage) {
+	if msg.GroupName == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for mmsi, s := range c.ships {
+		if s.GroupName == msg.GroupName {
+			log.Printf("[COORD] ship %d rejected by hook: %s", mmsi, msg.Reason)
+			delete(c.ships, mmsi)
+			return
+		}
 	}
 }
 
@@ -404,6 +428,13 @@ func (c *Coordinator) onAISUpdate(u ais.ShipUpdate) {
 	c.cache.Update(u.MMSI, ship.ShipType, ship.Length, ship.Beam, ship.Name)
 }
 
+// tickSnapshot holds per-ship data captured under lock for use outside the lock.
+type tickSnapshot struct {
+	mmsi    int
+	ship    TrackedShip // value copy
+	shipPtr *TrackedShip
+}
+
 func (c *Coordinator) tick() {
 	c.cfg.RLock()
 	enabled := c.cfg.AIS.Enabled
@@ -415,13 +446,14 @@ func (c *Coordinator) tick() {
 		return
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	now := time.Now()
 	staleThreshold := now.Add(-time.Duration(staleMinutes) * time.Minute)
 
-	// Count currently spawned.
+	// ---------------------------------------------------------------
+	// Phase 1: snapshot state under lock, build command lists
+	// ---------------------------------------------------------------
+	c.mu.Lock()
+
 	spawned := 0
 	for _, s := range c.ships {
 		if s.State == StateSpawned {
@@ -429,21 +461,23 @@ func (c *Coordinator) tick() {
 		}
 	}
 
-	// Remove stale ships.
+	// Collect stale ships to remove.
+	var staleCmds []dcscomm.Command
+	var staleMMSIs []int
 	for mmsi, s := range c.ships {
 		if s.LastSeen.Before(staleThreshold) {
 			if s.State == StateSpawned && s.GroupName != "" {
-				if err := c.dcs.Send(dcscomm.NewRemove(s.GroupName)); err != nil {
-					log.Printf("[COORD] remove stale %d error: %v", mmsi, err)
-				}
+				staleCmds = append(staleCmds, dcscomm.NewRemove(s.GroupName))
 				spawned--
 			}
-			delete(c.ships, mmsi)
+			staleMMSIs = append(staleMMSIs, mmsi)
 		}
 	}
+	for _, mmsi := range staleMMSIs {
+		delete(c.ships, mmsi)
+	}
 
-	// Collect pending ships sorted by SOG descending so moving vessels are
-	// spawned first when we're near the max-ships limit.
+	// Collect pending ships sorted by SOG descending.
 	type pendingEntry struct {
 		mmsi int
 		ship *TrackedShip
@@ -454,40 +488,53 @@ func (c *Coordinator) tick() {
 			pending = append(pending, pendingEntry{mmsi, s})
 		}
 	}
-	sort.Slice(pending, func(i, j int) bool {
-		return pending[i].ship.Sog > pending[j].ship.Sog
-	})
+	if len(pending) > 1 {
+		sort.Slice(pending, func(i, j int) bool {
+			return pending[i].ship.Sog > pending[j].ship.Sog
+		})
+	}
 
-	const staticThreshold = 0.5 // knots — below this, ship is considered anchored
+	const staticThreshold = 0.5
 
-	// Spawn pending ships, prioritising those that are moving.
+	// Build spawn commands. State changes are deferred until after a
+	// successful TCP send so a failed batch doesn't leave the coordinator
+	// out of sync with DCS.
+	type spawnCommit struct {
+		ship     *TrackedShip
+		name     string
+		isStatic bool
+	}
+	var spawnCmds []dcscomm.Command
+	var spawnCommits []spawnCommit
 	for _, pe := range pending {
 		if spawned >= maxShips {
 			break
 		}
 		s := pe.ship
-		// Freeze group name at spawn time so reroute/remove always use the
-		// same name even if the ship's AIS name updates later.
-		s.GroupName = fmt.Sprintf("%s - %d", s.Name, pe.mmsi)
+		groupName := fmt.Sprintf("%s - %d", s.Name, pe.mmsi)
 		headingRad := s.Heading * math.Pi / 180.0
 		speedMS := s.Sog * 0.514444
 		isStatic := s.Sog < staticThreshold
 
-		cmd := dcscomm.NewSpawn(s.GroupName, s.DCSModel, s.Lat, s.Lon, headingRad, speedMS, s.Name, isStatic)
-		if err := c.dcs.Send(cmd); err != nil {
-			log.Printf("[COORD] spawn %d error: %v", pe.mmsi, err)
-			continue
-		}
-		s.State = StateSpawned
-		s.IsStatic = isStatic
-		s.SpawnedLat = s.Lat
-		s.SpawnedLon = s.Lon
-		s.SpawnedHdg = s.Heading
+		spawnCmds = append(spawnCmds, dcscomm.NewSpawn(
+			groupName, s.DCSModel, s.Lat, s.Lon, headingRad, speedMS, s.Name, isStatic))
+		spawnCommits = append(spawnCommits, spawnCommit{ship: s, name: groupName, isStatic: isStatic})
 		spawned++
 	}
 
-	// Update spawned ships — reroute moving ones, convert static→group if they start moving.
-	for mmsi, s := range c.ships {
+	// Build reroute/conversion commands for spawned ships.
+	type updateCommit struct {
+		ship       *TrackedShip
+		lat, lon   float64
+		hdg        float64
+		isStatic   bool      // new value after conversion
+		converted  bool      // static→group conversion
+		rerouted   bool
+		rerouteAt  time.Time
+	}
+	var updateCmds []dcscomm.Command
+	var updateCommits []updateCommit
+	for _, s := range c.ships {
 		if s.State != StateSpawned || s.GroupName == "" {
 			continue
 		}
@@ -495,46 +542,89 @@ func (c *Coordinator) tick() {
 		headingRad := s.Heading * math.Pi / 180.0
 		speedMS := s.Sog * 0.514444
 
-		// If a static ship starts moving, convert to a dynamic group.
+		// Static→group conversion if the ship starts moving.
 		if s.IsStatic && s.Sog >= 1.0 {
-			// Remove the static object, then spawn as a group.
-			if err := c.dcs.Send(dcscomm.NewRemove(s.GroupName)); err != nil {
-				log.Printf("[COORD] remove static %d error: %v", mmsi, err)
-				continue
-			}
-			cmd := dcscomm.NewSpawn(s.GroupName, s.DCSModel, s.Lat, s.Lon, headingRad, speedMS, s.Name, false)
-			if err := c.dcs.Send(cmd); err != nil {
-				log.Printf("[COORD] static->group %d error: %v", mmsi, err)
-				continue
-			}
-			s.IsStatic = false
-			s.SpawnedLat = s.Lat
-			s.SpawnedLon = s.Lon
-			s.SpawnedHdg = s.Heading
+			updateCmds = append(updateCmds, dcscomm.NewRemove(s.GroupName))
+			updateCmds = append(updateCmds, dcscomm.NewSpawn(
+				s.GroupName, s.DCSModel, s.Lat, s.Lon, headingRad, speedMS, s.Name, false))
+			updateCommits = append(updateCommits, updateCommit{
+				ship: s, lat: s.Lat, lon: s.Lon, hdg: s.Heading,
+				isStatic: false, converted: true,
+			})
 			continue
 		}
 
-		// Static ships don't need rerouting — they just sit there.
 		if s.IsStatic {
 			continue
 		}
 
-		dist := geo.HaversineDistance(s.SpawnedLat, s.SpawnedLon, s.Lat, s.Lon)
+		// Per-ship reroute cooldown to avoid command churn from heading jitter.
+		if now.Sub(s.LastReroute) < minRerouteInterval {
+			continue
+		}
+
+		// Equirectangular distance approximation — much cheaper than haversine
+		// and accurate enough for a 200m threshold check.
+		dist := geo.EquirectangularDistance(s.SpawnedLat, s.SpawnedLon, s.Lat, s.Lon)
 		hdgDiff := math.Abs(s.Heading - s.SpawnedHdg)
 		if hdgDiff > 180 {
 			hdgDiff = 360 - hdgDiff
 		}
 
 		if dist > 200 || hdgDiff > 5 {
-			cmd := dcscomm.NewReroute(s.GroupName, s.DCSModel, s.Lat, s.Lon, headingRad, speedMS, s.Name)
-			if err := c.dcs.Send(cmd); err != nil {
-				log.Printf("[COORD] reroute %d error: %v", mmsi, err)
-				continue
-			}
-			s.SpawnedLat = s.Lat
-			s.SpawnedLon = s.Lon
-			s.SpawnedHdg = s.Heading
+			updateCmds = append(updateCmds, dcscomm.NewReroute(
+				s.GroupName, s.DCSModel, s.Lat, s.Lon, headingRad, speedMS, s.Name))
+			updateCommits = append(updateCommits, updateCommit{
+				ship: s, lat: s.Lat, lon: s.Lon, hdg: s.Heading,
+				rerouted: true, rerouteAt: now,
+			})
 		}
+	}
+
+	c.mu.Unlock()
+
+	// ---------------------------------------------------------------
+	// Phase 2: send commands outside the lock via batched writes
+	// ---------------------------------------------------------------
+	allCmds := make([]dcscomm.Command, 0, len(staleCmds)+len(spawnCmds)+len(updateCmds))
+	allCmds = append(allCmds, staleCmds...)
+	allCmds = append(allCmds, spawnCmds...)
+	allCmds = append(allCmds, updateCmds...)
+
+	if len(allCmds) > 0 {
+		if err := c.dcs.SendBatch(allCmds); err != nil {
+			log.Printf("[COORD] batch send error (%d cmds): %v", len(allCmds), err)
+			// Don't commit state changes — the commands didn't reach DCS.
+			// They'll be retried on the next tick.
+			return
+		}
+	}
+
+	// ---------------------------------------------------------------
+	// Phase 3: commit state changes under lock after successful send
+	// ---------------------------------------------------------------
+	if len(spawnCommits) > 0 || len(updateCommits) > 0 {
+		c.mu.Lock()
+		for _, sc := range spawnCommits {
+			sc.ship.GroupName = sc.name
+			sc.ship.State = StateSpawned
+			sc.ship.IsStatic = sc.isStatic
+			sc.ship.SpawnedLat = sc.ship.Lat
+			sc.ship.SpawnedLon = sc.ship.Lon
+			sc.ship.SpawnedHdg = sc.ship.Heading
+		}
+		for _, uc := range updateCommits {
+			if uc.converted {
+				uc.ship.IsStatic = uc.isStatic
+			}
+			uc.ship.SpawnedLat = uc.lat
+			uc.ship.SpawnedLon = uc.lon
+			uc.ship.SpawnedHdg = uc.hdg
+			if uc.rerouted {
+				uc.ship.LastReroute = uc.rerouteAt
+			}
+		}
+		c.mu.Unlock()
 	}
 }
 

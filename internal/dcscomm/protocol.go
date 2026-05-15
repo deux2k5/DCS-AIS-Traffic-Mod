@@ -15,11 +15,13 @@ type Command struct {
 
 // InboundMessage is a JSON message received from the Lua hook.
 type InboundMessage struct {
-	Type    string   `json:"type"`
-	Theatre string   `json:"theatre,omitempty"`
-	Ships   int      `json:"ships,omitempty"`
-	Error   string   `json:"error,omitempty"`
-	Models  []string `json:"models,omitempty"` // available ship unit types
+	Type      string   `json:"type"`
+	Theatre   string   `json:"theatre,omitempty"`
+	Ships     int      `json:"ships,omitempty"`
+	Error     string   `json:"error,omitempty"`
+	Models    []string `json:"models,omitempty"`  // available ship unit types
+	GroupName string   `json:"groupName,omitempty"` // for reject/error feedback
+	Reason    string   `json:"reason,omitempty"`    // reject reason (e.g. "land")
 }
 
 // NewSpawn creates a spawn command. If static is true, the hook spawns a static

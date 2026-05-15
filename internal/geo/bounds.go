@@ -17,7 +17,7 @@ var TheatreBounds = map[string]BoundingBox{
 	"PersianGulf":    {SW: [2]float64{20.0, 44.0}, NE: [2]float64{32.0, 60.0}},  // wider Gulf + Gulf of Oman
 	"Syria":          {SW: [2]float64{30.0, 29.0}, NE: [2]float64{40.0, 40.0}},  // eastern Med + Suez approach
 	"SinaiMap":       {SW: [2]float64{25.0, 30.0}, NE: [2]float64{35.0, 38.0}},  // Red Sea north + east Med
-	"Falklands":      {SW: [2]float64{57.0, -68.0}, NE: [2]float64{-46.0, -52.0}}, // wider South Atlantic
+	"Falklands":      {SW: [2]float64{-57.0, -68.0}, NE: [2]float64{-46.0, -52.0}}, // wider South Atlantic
 	"MarianaIslands": {SW: [2]float64{10.0, 141.0}, NE: [2]float64{18.0, 149.0}}, // wider Pacific around Guam
 	"Kola":           {SW: [2]float64{65.0, 24.0}, NE: [2]float64{74.0, 44.0}},  // Barents Sea + Norwegian coast
 }
@@ -46,6 +46,17 @@ func TheatreNames() []string {
 		"SinaiMap",
 		"Syria",
 	}
+}
+
+// EquirectangularDistance is a fast approximate distance in metres between two
+// lat/lon pairs. Uses a simple equirectangular projection which is accurate
+// enough for short distances (< 10 km) and much cheaper than haversine since
+// it avoids sin/cos/atan2/sqrt beyond one cosine call.
+func EquirectangularDistance(lat1, lon1, lat2, lon2 float64) float64 {
+	const metersPerDeg = 111320.0
+	dLat := (lat2 - lat1) * metersPerDeg
+	dLon := (lon2 - lon1) * metersPerDeg * math.Cos(degreesToRadians((lat1+lat2)/2))
+	return math.Sqrt(dLat*dLat + dLon*dLon)
 }
 
 // HaversineDistance computes the distance in metres between two lat/lon pairs.

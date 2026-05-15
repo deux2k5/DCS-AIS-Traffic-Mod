@@ -1,0 +1,9 @@
+*.exe
+*.zip
+*.lnk
+PsExec64.exe
+shipcache.json
+config.toml
+logo-base64.txt
+*.log
+.context/

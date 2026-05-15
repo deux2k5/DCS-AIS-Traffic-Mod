@@ -1,0 +1,21 @@
+[ais]
+api-key = ""
+enabled = false
+max-ships = 40
+update-seconds = 30
+stale-minutes = 10
+
+[dcs]
+hook-port = 18420
+
+[web]
+port = 8380
+
+[filters]
+fishing = true
+cargo = true
+tanker = true
+passenger = true
+tug = true
+pleasure = true
+other = true

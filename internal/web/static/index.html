@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AIS | DCS Traffic</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23007aff'/%3E%3Ctext x='3' y='22' font-size='18' font-weight='800' fill='white' font-family='system-ui'%3EA%3C/text%3E%3Crect x='14.5' y='7' width='3' height='16' rx='1.5' fill='rgba(255,255,255,0.6)'/%3E%3Ctext x='19' y='22' font-size='18' font-weight='800' fill='white' font-family='system-ui'%3ES%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top-bar">
+    <img src="logo.png" alt="AIS DCS Traffic" class="logo-img">
+    <div class="header-right">
+      <div class="indicators">
+        <span class="indicator">
+          <span class="dot" id="ais-dot"></span>
+          AIS Stream
+        </span>
+        <span class="indicator">
+          <span class="dot" id="hook-dot"></span>
+          DCS Hook
+        </span>
+      </div>
+      <button class="theme-toggle" id="theme-toggle" title="Toggle theme">
+        <span id="theme-icon">&#9790;</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="dashboard">
+    <section class="sidebar">
+      <div class="toggle-row">
+        <span class="toggle-text" id="toggle-text">Disabled</span>
+        <label class="switch">
+          <input type="checkbox" id="enable-toggle">
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="info-row">
+        <div class="info-item">
+          <span class="info-label">Theatre</span>
+          <span class="info-value" id="theatre-value">--</span>
+        </div>
+        <div class="info-item">
+          <span class="info-label">Models</span>
+          <span class="info-value" id="models-value">--</span>
+        </div>
+      </div>
+
+      <div class="stats-row">
+        <div class="stat-block">
+          <span class="stat-number accent" id="spawned-count">0</span>
+          <span class="stat-label">In DCS</span>
+        </div>
+        <div class="stat-block">
+          <span class="stat-number yellow" id="pending-count">0</span>
+          <span class="stat-label">Pending</span>
+        </div>
+        <div class="stat-block">
+          <span class="stat-number" id="ship-count">0</span>
+          <span class="stat-label">Tracked</span>
+        </div>
+      </div>
+
+      <div class="category-bar" id="category-bar"></div>
+
+      <div class="divider"></div>
+
+      <div class="section-block">
+        <h2>Settings</h2>
+        <div class="setting-row">
+          <label for="api-key">API Key</label>
+          <div class="api-key-row">
+            <input type="password" id="api-key" placeholder="aisstream.io API key" autocomplete="off">
+            <button class="btn" id="save-api-key">Save</button>
+          </div>
+        </div>
+        <div class="setting-row">
+          <label for="max-ships">Max Ships <span id="max-ships-val">100</span></label>
+          <input type="range" id="max-ships" min="10" max="200" value="100">
+        </div>
+        <div class="setting-row">
+          <label for="update-interval">Update Interval <span id="update-interval-val">30</span>s</label>
+          <input type="range" id="update-interval" min="10" max="60" value="30">
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="section-block">
+        <h2>Filters</h2>
+        <div class="filter-grid">
+          <label class="filter-item"><input type="checkbox" data-filter="fishing" checked> Fishing</label>
+          <label class="filter-item"><input type="checkbox" data-filter="cargo" checked> Cargo</label>
+          <label class="filter-item"><input type="checkbox" data-filter="tanker" checked> Tanker</label>
+          <label class="filter-item"><input type="checkbox" data-filter="passenger" checked> Passenger</label>
+          <label class="filter-item"><input type="checkbox" data-filter="tug" checked> Tug</label>
+          <label class="filter-item"><input type="checkbox" data-filter="pleasure" checked> Pleasure</label>
+          <label class="filter-item"><input type="checkbox" data-filter="other" checked> Other</label>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="section-block">
+        <h2>Update</h2>
+        <div class="update-row">
+          <span class="update-status" id="update-status">--</span>
+          <button class="btn" id="check-update">Check</button>
+          <button class="btn btn-accent" id="apply-update" disabled>Update</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="ship-section">
+      <h2>Tracked Ships</h2>
+      <div class="table-wrap">
+        <table id="ship-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Category</th>
+              <th>DCS Model</th>
+              <th>Length</th>
+              <th>Pos</th>
+              <th>HDG</th>
+              <th>SOG</th>
+              <th>Seen</th>
+              <th>State</th>
+            </tr>
+          </thead>
+          <tbody id="ship-tbody">
+          </tbody>
+        </table>
+        <div class="empty-state" id="empty-state">No ships being tracked</div>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

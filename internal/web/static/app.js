@@ -553,45 +553,124 @@
     if (e.key === "Enter") saveServerNameBtn.click();
   });
 
+  // ------ Folder picker ------
+  var folderPickerModal = document.getElementById("folder-picker-modal");
+  var folderBreadcrumb = document.getElementById("folder-breadcrumb");
+  var folderDrives = document.getElementById("folder-drives");
+  var folderList = document.getElementById("folder-list");
+  var folderPickerCancel = document.getElementById("folder-picker-cancel");
+  var folderPickerSelect = document.getElementById("folder-picker-select");
+  var folderPickerCallback = null;
+  var folderPickerCurrent = "";
+
+  function openFolderPicker(callback, startPath) {
+    folderPickerCallback = callback;
+    folderPickerModal.style.display = "flex";
+    browseTo(startPath || "");
+  }
+
+  function browseTo(path) {
+    fetch("/api/browse-folder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: path })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        folderPickerCurrent = data.current || "";
+        folderBreadcrumb.textContent = folderPickerCurrent;
+
+        // Drive buttons
+        folderDrives.innerHTML = "";
+        if (data.drives && data.drives.length > 0) {
+          for (var i = 0; i < data.drives.length; i++) {
+            (function (drv) {
+              var btn = document.createElement("button");
+              btn.className = "drive-btn";
+              btn.textContent = drv;
+              btn.addEventListener("click", function () { browseTo(drv); });
+              folderDrives.appendChild(btn);
+            })(data.drives[i]);
+          }
+        }
+
+        // Directory list
+        folderList.innerHTML = "";
+
+        // Parent directory link
+        if (data.parent) {
+          var parentItem = document.createElement("div");
+          parentItem.className = "folder-item parent-dir";
+          parentItem.innerHTML = '<span class="folder-icon">↑</span> ..';
+          parentItem.addEventListener("click", function () { browseTo(data.parent); });
+          folderList.appendChild(parentItem);
+        }
+
+        // Subdirectories
+        var dirs = data.dirs || [];
+        for (var j = 0; j < dirs.length; j++) {
+          (function (d) {
+            var item = document.createElement("div");
+            item.className = "folder-item";
+            item.innerHTML = '<span class="folder-icon">📁</span> ' + escapeHTML(d.name);
+            item.addEventListener("click", function () { browseTo(d.path); });
+            folderList.appendChild(item);
+          })(dirs[j]);
+        }
+
+        if (dirs.length === 0 && !data.parent) {
+          var empty = document.createElement("div");
+          empty.className = "folder-item";
+          empty.style.color = "var(--text-tertiary)";
+          empty.textContent = "No subdirectories";
+          folderList.appendChild(empty);
+        }
+      })
+      .catch(function () {
+        folderBreadcrumb.textContent = "Error loading directory";
+      });
+  }
+
+  folderPickerSelect.addEventListener("click", function () {
+    if (folderPickerCallback && folderPickerCurrent) {
+      folderPickerCallback(folderPickerCurrent);
+    }
+    folderPickerModal.style.display = "none";
+    folderPickerCallback = null;
+  });
+
+  folderPickerCancel.addEventListener("click", function () {
+    folderPickerModal.style.display = "none";
+    folderPickerCallback = null;
+  });
+
+  folderPickerModal.addEventListener("click", function (e) {
+    if (e.target === folderPickerModal) {
+      folderPickerModal.style.display = "none";
+      folderPickerCallback = null;
+    }
+  });
+
   // ------ Event handlers: browse saved games path ------
   browsePathBtn.addEventListener("click", function () {
     if (!currentServerId) return;
-    browsePathBtn.disabled = true;
-    browsePathBtn.textContent = "Browsing...";
     var serverId = currentServerId;
-    fetch("/api/browse-folder", { method: "POST" })
-      .then(function (r) { return r.json(); })
-      .then(function (data) {
-        if (!data.path) return;
-        return fetch("/api/servers/" + serverId, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ savedGamesPath: data.path })
-        }).then(function () {
-          prevPanelJSON = "";
-          fetchServers();
-        });
-      })
-      .catch(function () {})
-      .finally(function () {
-        browsePathBtn.disabled = false;
-        browsePathBtn.textContent = "Browse";
+    openFolderPicker(function (path) {
+      fetch("/api/servers/" + serverId, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ savedGamesPath: path })
+      }).then(function () {
+        prevPanelJSON = "";
+        fetchServers();
       });
+    });
   });
 
   modalBrowse.addEventListener("click", function () {
-    modalBrowse.disabled = true;
-    modalBrowse.textContent = "Browsing...";
-    fetch("/api/browse-folder", { method: "POST" })
-      .then(function (r) { return r.json(); })
-      .then(function (data) {
-        if (data.path) newServerPath.value = data.path;
-      })
-      .catch(function () {})
-      .finally(function () {
-        modalBrowse.disabled = false;
-        modalBrowse.textContent = "Browse";
-      });
+    openFolderPicker(function (path) {
+      newServerPath.value = path;
+    });
   });
 
   // ------ Event handlers: remove server ------

@@ -7,8 +7,10 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
-	"os/exec"
+	"os"
+	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/deux2k5/dcs-ais-traffic/internal/config"
@@ -197,41 +199,112 @@ func (s *Server) handleConfigPost(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, snap)
 }
 
+// BrowseResponse is returned by POST /api/browse-folder.
+type BrowseResponse struct {
+	Current string       `json:"current"`
+	Parent  string       `json:"parent"`
+	Dirs    []BrowseDir  `json:"dirs"`
+	Drives  []string     `json:"drives,omitempty"`
+}
+
+// BrowseDir is a single directory entry in the browse response.
+type BrowseDir struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
 func (s *Server) handleBrowseFolder(w http.ResponseWriter, r *http.Request) {
-	if runtime.GOOS != "windows" {
-		http.Error(w, "folder browser only supported on Windows", http.StatusBadRequest)
-		return
+	var req struct {
+		Path string `json:"path"`
+	}
+	if r.Body != nil {
+		json.NewDecoder(r.Body).Decode(&req)
 	}
 
-	// FolderBrowserDialog requires STA threading and a topmost parent form
-	// so the dialog appears above the browser window instead of behind it.
-	script := `Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.Application]::EnableVisualStyles()
-$owner = New-Object System.Windows.Forms.Form
-$owner.TopMost = $true
-$owner.ShowInTaskbar = $false
-$owner.WindowState = 'Minimized'
-$owner.Show()
-$owner.Visible = $false
-$f = New-Object System.Windows.Forms.FolderBrowserDialog
-$f.Description = "Select DCS Saved Games folder"
-$f.ShowNewFolderButton = $false
-$result = $f.ShowDialog($owner)
-$owner.Close()
-if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-  Write-Output $f.SelectedPath
-}`
+	// Default starting path: user's home directory or Saved Games if it exists.
+	if req.Path == "" {
+		req.Path = defaultBrowsePath()
+	}
 
-	cmd := exec.Command("powershell", "-STA", "-NoProfile", "-Command", script)
-	out, err := cmd.Output()
+	// Clean and resolve the path.
+	cleanPath := filepath.Clean(req.Path)
+
+	resp := BrowseResponse{
+		Current: cleanPath,
+	}
+
+	// On Windows, if at a drive root or empty, include drive letters.
+	if runtime.GOOS == "windows" {
+		resp.Drives = listDrives()
+	}
+
+	// Set parent (go up one level).
+	parent := filepath.Dir(cleanPath)
+	if parent != cleanPath {
+		resp.Parent = parent
+	}
+
+	// List subdirectories only (no files — this is a folder picker).
+	entries, err := os.ReadDir(cleanPath)
 	if err != nil {
-		log.Printf("[WEB] folder browse error: %v", err)
-		http.Error(w, "folder dialog failed", http.StatusInternalServerError)
+		log.Printf("[WEB] browse error for %q: %v", cleanPath, err)
+		// Still return what we have (drives, current) so the UI can recover.
+		writeJSON(w, resp)
 		return
 	}
 
-	path := strings.TrimSpace(string(out))
-	writeJSON(w, map[string]string{"path": path})
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// Skip hidden/system directories.
+		if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "$") {
+			continue
+		}
+		resp.Dirs = append(resp.Dirs, BrowseDir{
+			Name: name,
+			Path: filepath.Join(cleanPath, name),
+		})
+	}
+
+	sort.Slice(resp.Dirs, func(i, j int) bool {
+		return strings.ToLower(resp.Dirs[i].Name) < strings.ToLower(resp.Dirs[j].Name)
+	})
+
+	writeJSON(w, resp)
+}
+
+// defaultBrowsePath returns a sensible starting directory for the folder browser.
+func defaultBrowsePath() string {
+	// Try "Saved Games" first (common DCS location).
+	home, err := os.UserHomeDir()
+	if err == nil {
+		sg := filepath.Join(home, "Saved Games")
+		if info, err := os.Stat(sg); err == nil && info.IsDir() {
+			return sg
+		}
+		return home
+	}
+	if runtime.GOOS == "windows" {
+		return `C:\`
+	}
+	return "/"
+}
+
+// listDrives returns available Windows drive letters.
+func listDrives() []string {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	var drives []string
+	for c := 'A'; c <= 'Z'; c++ {
+		root := string(c) + `:\`
+		if _, err := os.Stat(root); err == nil {
+			drives = append(drives, root)
+		}
+	}
+	return drives
 }
 
 // --------------------------------------------------------------------------

@@ -203,14 +203,21 @@ func (s *Server) handleBrowseFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// FolderBrowserDialog requires STA threading. Use -STA flag and
-	// explicitly call ShowDialog with a dummy owner window handle.
+	// FolderBrowserDialog requires STA threading and a topmost parent form
+	// so the dialog appears above the browser window instead of behind it.
 	script := `Add-Type -AssemblyName System.Windows.Forms
 [System.Windows.Forms.Application]::EnableVisualStyles()
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.WindowState = 'Minimized'
+$owner.Show()
+$owner.Visible = $false
 $f = New-Object System.Windows.Forms.FolderBrowserDialog
 $f.Description = "Select DCS Saved Games folder"
 $f.ShowNewFolderButton = $false
-$result = $f.ShowDialog()
+$result = $f.ShowDialog($owner)
+$owner.Close()
 if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
   Write-Output $f.SelectedPath
 }`

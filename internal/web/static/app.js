@@ -46,6 +46,12 @@
   var currentServerId = null;
   var serverList = [];
 
+  // ------ Dirty-check caches (skip DOM writes when data unchanged) ------
+  var prevServerJSON = "";       // JSON of server list for dropdown diffing
+  var prevPanelJSON = "";        // JSON of selected server for panel diffing
+  var prevShipsJSON = "";        // JSON of ships array for table diffing
+  var prevAISConnected = null;
+
   // ------ Sort state ------
   var sortCol = "state";
   var sortAsc = true;
@@ -80,6 +86,9 @@
             sortAsc = true;
           }
           updateSortIndicators();
+          // Re-sort and rebuild ship table immediately on header click.
+          prevShipsJSON = "";
+          fetchShips();
         });
       })(i);
     }
@@ -156,16 +165,36 @@
     return ships;
   }
 
+  // ------ Lightweight JSON fingerprint for dirty checks ------
+  // For server list: only care about id, name, hookConnected (dropdown display)
+  function serverListFingerprint(servers) {
+    var parts = [];
+    for (var i = 0; i < servers.length; i++) {
+      parts.push(servers[i].id + ":" + servers[i].name + ":" + (servers[i].hookConnected ? 1 : 0));
+    }
+    return parts.join("|");
+  }
+
   // ------ Server list (single endpoint provides everything the UI needs) ------
   function fetchServers() {
     fetch("/api/servers")
       .then(function (r) { return r.json(); })
       .then(function (data) {
-        aisDot.className = data.aisConnected ? "dot connected" : "dot";
+        // AIS dot: skip DOM write if unchanged.
+        if (prevAISConnected !== data.aisConnected) {
+          prevAISConnected = data.aisConnected;
+          aisDot.className = data.aisConnected ? "dot connected" : "dot";
+        }
 
         var servers = data.servers || [];
         serverList = servers;
-        renderServerSelect();
+
+        // Only rebuild dropdown if server list display data changed.
+        var fp = serverListFingerprint(servers);
+        if (fp !== prevServerJSON) {
+          prevServerJSON = fp;
+          renderServerSelect();
+        }
 
         if (servers.length === 0) {
           welcomeState.style.display = "block";
@@ -185,6 +214,7 @@
         if (!found) {
           currentServerId = servers[0].id;
           serverSelect.value = currentServerId;
+          prevPanelJSON = ""; // force panel update for new selection
         }
 
         serverPanel.style.display = "block";
@@ -218,6 +248,8 @@
 
   serverSelect.addEventListener("change", function () {
     currentServerId = serverSelect.value;
+    prevPanelJSON = ""; // force panel update for new selection
+    prevShipsJSON = ""; // force ship table rebuild
     fetchShips();
     // Panel updates immediately from cached serverList.
     for (var i = 0; i < serverList.length; i++) {
@@ -230,6 +262,16 @@
 
   // ------ Per-server panel update (from server list data, no extra request) ------
   function updateServerPanel(data) {
+    // Build a fingerprint of all panel-relevant fields. Skip DOM writes if nothing changed.
+    var panelFP = data.hookConnected + "|" + data.enabled + "|" + (data.theatre || "") + "|" +
+      data.modelsLoaded + "|" + data.shipCount + "|" + data.spawnedCount + "|" + data.pendingCount + "|" +
+      data.maxShips + "|" + data.updateSeconds + "|" + (data.savedGamesPath || "") + "|" +
+      data.hookDeployed + "|" + (data.name || "") + "|" + JSON.stringify(data.categories || {}) + "|" +
+      JSON.stringify(data.filters || {});
+
+    if (panelFP === prevPanelJSON) return;
+    prevPanelJSON = panelFP;
+
     hookDot.className = data.hookConnected ? "dot connected" : "dot";
 
     ignoreNextToggle = true;
@@ -269,12 +311,14 @@
 
     var filters = data.filters;
     if (filters) {
-      document.querySelectorAll("[data-filter]").forEach(function (el) {
+      var filterEls = document.querySelectorAll("[data-filter]");
+      for (var i = 0; i < filterEls.length; i++) {
+        var el = filterEls[i];
         var key = el.getAttribute("data-filter");
         if (filters.hasOwnProperty(key)) {
           el.checked = filters[key];
         }
-      });
+      }
     }
 
     renderCategoryBar(data.categories || {}, data.shipCount || 0);
@@ -282,7 +326,7 @@
 
   function renderCategoryBar(cats, total) {
     if (total === 0) {
-      categoryBar.innerHTML = "";
+      if (categoryBar.innerHTML !== "") categoryBar.innerHTML = "";
       return;
     }
 
@@ -318,14 +362,31 @@
       .then(function (r) { return r.json(); })
       .then(function (ships) {
         if (!ships || ships.length === 0) {
-          clearShipTable();
+          if (prevShipsJSON !== "empty") {
+            prevShipsJSON = "empty";
+            clearShipTable();
+          }
           return;
         }
 
+        sortShips(ships);
+
+        // Build a fingerprint to skip DOM rebuild when nothing changed.
+        // Include sort state so re-sorts trigger a rebuild.
+        var fp = sortCol + sortAsc;
+        for (var k = 0; k < ships.length; k++) {
+          var sh = ships[k];
+          fp += "|" + sh.mmsi + ":" + sh.state + ":" + (sh.sog || 0).toFixed(1) + ":" +
+            (sh.heading >= 0 ? Math.round(sh.heading) : -1) + ":" +
+            (sh.lat || 0).toFixed(3) + ":" + (sh.lon || 0).toFixed(3) + ":" +
+            (sh.dcsModel || "") + ":" + (sh.lastSeen || "");
+        }
+
+        if (fp === prevShipsJSON) return;
+        prevShipsJSON = fp;
+
         shipTable.style.display = "table";
         emptyState.className = "empty-state";
-
-        sortShips(ships);
 
         var now = Date.now();
         var html = "";
@@ -482,6 +543,8 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: name })
     }).then(function () {
+      prevServerJSON = ""; // force dropdown rebuild
+      prevPanelJSON = "";  // force panel refresh
       fetchServers();
     });
   });
@@ -491,32 +554,44 @@
   });
 
   // ------ Event handlers: browse saved games path ------
-  function browseFolder(callback) {
+  browsePathBtn.addEventListener("click", function () {
+    if (!currentServerId) return;
+    browsePathBtn.disabled = true;
+    browsePathBtn.textContent = "Browsing...";
+    var serverId = currentServerId;
     fetch("/api/browse-folder", { method: "POST" })
       .then(function (r) { return r.json(); })
       .then(function (data) {
-        if (data.path) callback(data.path);
+        if (!data.path) return;
+        return fetch("/api/servers/" + serverId, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ savedGamesPath: data.path })
+        }).then(function () {
+          prevPanelJSON = "";
+          fetchServers();
+        });
       })
-      .catch(function () {});
-  }
-
-  browsePathBtn.addEventListener("click", function () {
-    if (!currentServerId) return;
-    browseFolder(function (path) {
-      fetch("/api/servers/" + currentServerId, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ savedGamesPath: path })
-      }).then(function () {
-        fetchServers();
+      .catch(function () {})
+      .finally(function () {
+        browsePathBtn.disabled = false;
+        browsePathBtn.textContent = "Browse";
       });
-    });
   });
 
   modalBrowse.addEventListener("click", function () {
-    browseFolder(function (path) {
-      newServerPath.value = path;
-    });
+    modalBrowse.disabled = true;
+    modalBrowse.textContent = "Browsing...";
+    fetch("/api/browse-folder", { method: "POST" })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.path) newServerPath.value = data.path;
+      })
+      .catch(function () {})
+      .finally(function () {
+        modalBrowse.disabled = false;
+        modalBrowse.textContent = "Browse";
+      });
   });
 
   // ------ Event handlers: remove server ------
@@ -528,6 +603,9 @@
     fetch("/api/servers/" + currentServerId, { method: "DELETE" })
       .then(function () {
         currentServerId = null;
+        prevServerJSON = "";
+        prevPanelJSON = "";
+        prevShipsJSON = "";
         fetchServers();
       });
   });
@@ -574,6 +652,8 @@
       .then(function (data) {
         addServerModal.style.display = "none";
         currentServerId = data.id;
+        prevServerJSON = "";
+        prevPanelJSON = "";
         fetchServers();
       })
       .catch(function (err) {

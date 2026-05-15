@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	githubRepo = "deux2k5/dcs-ais-traffic"
+	githubRepo = "deux2k5/dcs-ais-traffic-v2"
 	apiURL     = "https://api.github.com/repos/" + githubRepo + "/releases/latest"
 )
 

@@ -383,9 +383,17 @@ func (c *Coordinator) Stop() {
 // Disabling tracking also disables spawning (can't spawn without data).
 func (c *Coordinator) ToggleTracking(enabled bool) {
 	c.globalCfg.Lock()
+	// Update coordinator's local copy (used by tick/OnAISUpdate).
 	c.serverCfg.TrackingEnabled = enabled
 	if !enabled {
 		c.serverCfg.SpawnEnabled = false
+	}
+	// Update canonical config entry (used by web API reads and disk persistence).
+	if srv := c.globalCfg.ServerByID(c.id); srv != nil {
+		srv.TrackingEnabled = enabled
+		if !enabled {
+			srv.SpawnEnabled = false
+		}
 	}
 	c.globalCfg.Unlock()
 	_ = c.globalCfg.Save()
@@ -401,6 +409,9 @@ func (c *Coordinator) ToggleTracking(enabled bool) {
 func (c *Coordinator) ToggleSpawning(enabled bool) {
 	c.globalCfg.Lock()
 	c.serverCfg.SpawnEnabled = enabled
+	if srv := c.globalCfg.ServerByID(c.id); srv != nil {
+		srv.SpawnEnabled = enabled
+	}
 	c.globalCfg.Unlock()
 	_ = c.globalCfg.Save()
 

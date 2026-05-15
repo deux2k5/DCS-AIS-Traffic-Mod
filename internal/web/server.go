@@ -496,6 +496,14 @@ func (s *Server) handleServerToggle(w http.ResponseWriter, r *http.Request) {
 
 	inst.Coordinator.Toggle(req.Enabled)
 
+	// Persist enabled state to config.
+	s.cfg.Lock()
+	if srv := s.cfg.ServerByID(id); srv != nil {
+		srv.Enabled = req.Enabled
+	}
+	s.cfg.Unlock()
+	s.cfg.Save()
+
 	// Refresh AIS since enabled/disabled affects which theatres are active.
 	s.mgr.RefreshAIS()
 

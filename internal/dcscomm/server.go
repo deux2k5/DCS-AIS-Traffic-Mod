@@ -128,8 +128,12 @@ func (s *Server) dial() (net.Conn, error) {
 	}
 
 	// Set TCP_NODELAY for lower latency on small writes.
+	// Enable TCP keepalive so a crashed DCS (no FIN sent) gets detected
+	// within ~30s instead of hanging the readLoop forever.
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(10 * time.Second)
 	}
 
 	return conn, nil

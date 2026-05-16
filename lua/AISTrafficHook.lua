@@ -38,6 +38,7 @@ AIS.connected        = false
 AIS.recvBuffer       = ""       -- incomplete data from TCP reads
 AIS.bufferOffset     = 1        -- read position in recvBuffer (avoids O(n^2) sub)
 AIS.lastPollTime     = 0
+AIS.lastListenRetry  = 0        -- rate-limit listener bind retries (avoid log spam)
 AIS.trackedGroups    = {}       -- [groupName] = "group" | "static"
 AIS.theatre          = nil      -- current map name
 AIS.unitCounter      = 0        -- monotonic counter for unique unit IDs
@@ -104,6 +105,22 @@ local function tcpDisconnect()
     AIS.recvBuffer = ""
     AIS.bufferOffset = 1
     logInfo("Client disconnected from AIS hook")
+end
+
+--- Send a JSON message (appends newline).
+-- @param tbl table to JSON-encode
+local function tcpSend(tbl)
+    if not AIS.connected or not AIS.tcp then
+        return false
+    end
+    local payload = JSON:encode(tbl) .. "\n"
+    local ok, err = AIS.tcp:send(payload)
+    if not ok then
+        logError("TCP send failed: " .. tostring(err))
+        tcpDisconnect()
+        return false
+    end
+    return true
 end
 
 --- Check for a new incoming connection (non-blocking).
@@ -177,22 +194,6 @@ local function tcpAccept()
     return true
 end
 
---- Send a JSON message (appends newline).
--- @param tbl table to JSON-encode
-function tcpSend(tbl)
-    if not AIS.connected or not AIS.tcp then
-        return false
-    end
-    local payload = JSON:encode(tbl) .. "\n"
-    local ok, err = AIS.tcp:send(payload)
-    if not ok then
-        logError("TCP send failed: " .. tostring(err))
-        tcpDisconnect()
-        return false
-    end
-    return true
-end
-
 --- Read available data from the socket, split on newlines, return complete lines.
 -- Uses offset tracking to avoid O(n^2) string.sub on large buffers.
 -- @return table of complete JSON strings (may be empty)
@@ -202,12 +203,21 @@ local function tcpReadLines()
         return lines
     end
 
-    -- Read in a loop until the socket would block
+    -- Read in a loop until the socket would block.
+    -- Cap total buffer at 256KB to prevent unbounded growth from malformed input.
+    local MAX_BUFFER = 262144
     while true do
         local data, err, partial = AIS.tcp:receive(4096)
         local chunk = data or partial
         if chunk and #chunk > 0 then
             AIS.recvBuffer = AIS.recvBuffer .. chunk
+        end
+        if #AIS.recvBuffer > MAX_BUFFER then
+            logWarning("Receive buffer exceeded 256KB, dropping and disconnecting")
+            AIS.recvBuffer = ""
+            AIS.bufferOffset = 1
+            tcpDisconnect()
+            break
         end
         if err == "timeout" then
             break
@@ -623,8 +633,13 @@ end
 -- ---------------------------------------------------------------------------
 
 local function poll()
-    -- If listener failed to bind (port busy at load time), retry it.
+    -- If listener failed to bind (port busy at load time), retry with backoff.
     if not AIS.listener then
+        local now = socket.gettime()
+        if now - AIS.lastListenRetry < 10 then
+            return -- retry every 10s, not every 0.5s
+        end
+        AIS.lastListenRetry = now
         tcpListen()
         return
     end

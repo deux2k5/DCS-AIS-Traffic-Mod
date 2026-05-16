@@ -623,6 +623,12 @@ end
 -- ---------------------------------------------------------------------------
 
 local function poll()
+    -- If listener failed to bind (port busy at load time), retry it.
+    if not AIS.listener then
+        tcpListen()
+        return
+    end
+
     -- If not connected, check for incoming connection (non-blocking).
     if not AIS.connected then
         tcpAccept()

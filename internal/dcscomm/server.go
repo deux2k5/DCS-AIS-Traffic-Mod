@@ -78,6 +78,15 @@ func (s *Server) Start() error {
 			continue
 		}
 
+		// Check stop AFTER dial — Stop() may have fired while we were
+		// blocking in DialTimeout. Don't publish a stale connection.
+		select {
+		case <-s.stopCh:
+			_ = conn.Close()
+			return nil
+		default:
+		}
+
 		// Connected.
 		s.mu.Lock()
 		if s.conn != nil {

@@ -5,6 +5,9 @@
     Go application via TCP to spawn, move, and remove ships based on real-world
     AIS vessel data.
 
+    The hook listens on a TCP port and the Go exe connects to it when running.
+    When the exe is not running, the hook sits idle with near-zero overhead.
+
     Protocol: newline-delimited JSON over TCP on localhost:18420
 ]]
 
@@ -22,7 +25,6 @@ local AIS = {}
 AIS.TCP_HOST            = "127.0.0.1"
 AIS.TCP_PORT            = 18420
 AIS.POLL_INTERVAL       = 0.5   -- seconds between TCP reads
-AIS.RECONNECT_INTERVAL  = 10    -- seconds between reconnect attempts
 AIS.MAX_CMDS_PER_POLL   = 2     -- max expensive commands (spawn/remove/move) per poll
 AIS.MAX_REROUTES_PER_POLL = 4   -- max reroute commands per poll (cheaper than spawn)
 AIS.DEBUG               = false -- set true to enable per-command log lines
@@ -30,13 +32,12 @@ AIS.DEBUG               = false -- set true to enable per-command log lines
 -- ---------------------------------------------------------------------------
 -- State
 -- ---------------------------------------------------------------------------
-AIS.tcp              = nil      -- TCP socket handle
+AIS.listener         = nil      -- TCP server socket
+AIS.tcp              = nil      -- accepted client socket
 AIS.connected        = false
-AIS.pendingTcp       = nil      -- socket during non-blocking connect phase
 AIS.recvBuffer       = ""       -- incomplete data from TCP reads
 AIS.bufferOffset     = 1        -- read position in recvBuffer (avoids O(n^2) sub)
 AIS.lastPollTime     = 0
-AIS.lastReconnect    = 0
 AIS.trackedGroups    = {}       -- [groupName] = "group" | "static"
 AIS.theatre          = nil      -- current map name
 AIS.unitCounter      = 0        -- monotonic counter for unique unit IDs
@@ -68,66 +69,78 @@ end
 -- TCP helpers
 -- ---------------------------------------------------------------------------
 
---- Disconnect and clean up the socket.
+--- Start listening on the configured port.
+-- @return boolean success
+local function tcpListen()
+    if AIS.listener then return true end
+
+    local ln, err = socket.bind(AIS.TCP_HOST, AIS.TCP_PORT)
+    if not ln then
+        logError("Failed to bind TCP port " .. tostring(AIS.TCP_PORT) .. ": " .. tostring(err))
+        return false
+    end
+
+    ln:settimeout(0) -- non-blocking accept
+    AIS.listener = ln
+    logInfo("Listening on " .. AIS.TCP_HOST .. ":" .. tostring(AIS.TCP_PORT))
+    return true
+end
+
+--- Close the listener.
+local function tcpStopListening()
+    if AIS.listener then
+        pcall(function() AIS.listener:close() end)
+        AIS.listener = nil
+    end
+end
+
+--- Disconnect the current client and clean up.
 local function tcpDisconnect()
     if AIS.tcp then
         pcall(function() AIS.tcp:close() end)
         AIS.tcp = nil
     end
-    if AIS.pendingTcp then
-        pcall(function() AIS.pendingTcp:close() end)
-        AIS.pendingTcp = nil
-    end
     AIS.connected = false
     AIS.recvBuffer = ""
     AIS.bufferOffset = 1
-    logInfo("Disconnected from AIS backend")
+    logInfo("Client disconnected from AIS hook")
 end
 
---- Send a JSON message (appends newline).
--- @param tbl table to JSON-encode
-local function tcpSend(tbl)
-    if not AIS.connected or not AIS.tcp then
-        return false
+--- Check for a new incoming connection (non-blocking).
+-- @return boolean true if a new client was accepted
+local function tcpAccept()
+    if not AIS.listener then return false end
+    if AIS.connected then return false end -- already have a client
+
+    local client, err = AIS.listener:accept()
+    if not client then
+        return false -- no pending connection (timeout with non-blocking)
     end
-    local payload = JSON:encode(tbl) .. "\n"
-    local ok, err = AIS.tcp:send(payload)
-    if not ok then
-        logError("TCP send failed: " .. tostring(err))
-        tcpDisconnect()
-        return false
-    end
-    return true
-end
 
---- Send the theatre identification message.
-local function tcpSendTheatre()
-    logInfo("Sending theatre: " .. tostring(AIS.theatre))
-    tcpSend({ type = "theatre", theatre = AIS.theatre })
-end
+    -- Got a new client connection from the exe.
+    client:settimeout(0) -- non-blocking for all subsequent I/O
+    client:setoption("tcp-nodelay", true)
 
---- Finalize a new connection: detect theatre, send models to backend.
-local function onConnectSuccess()
-    AIS.tcp:settimeout(0) -- non-blocking for all subsequent I/O
-    AIS.tcp:setoption("tcp-nodelay", true)
+    AIS.tcp = client
     AIS.connected = true
     AIS.recvBuffer = ""
     AIS.bufferOffset = 1
     AIS.helpersInstalled = false
-    logInfo("Connected to AIS backend")
 
-    -- Detect theatre if we don't know it yet (e.g. hook loaded mid-mission)
+    logInfo("Exe connected to AIS hook")
+
+    -- Send theatre info to the exe.
     if not AIS.theatre then
         local tok, tresult = pcall(net.dostring_in, 'server', 'return env.mission.theatre')
         if tok and tresult and #tresult > 0 then
             AIS.theatre = tresult
-            logInfo("Theatre detected on connect: " .. AIS.theatre)
+            logInfo("Theatre detected on accept: " .. AIS.theatre)
         end
     end
 
-    -- Send theatre to backend
     if AIS.theatre then
-        tcpSendTheatre()
+        logInfo("Sending theatre: " .. tostring(AIS.theatre))
+        tcpSend({ type = "theatre", theatre = AIS.theatre })
     end
 
     -- Detect available ship models so the backend only uses installed ones.
@@ -160,73 +173,24 @@ local function onConnectSuccess()
         logInfo(string.format("Detected %d ship models available", #available))
         tcpSend({ type = "models", models = available })
     end
+
+    return true
 end
 
---- Attempt to connect to the Go backend (non-blocking).
--- Uses a two-phase approach to avoid ANY blocking on the DCS frame thread:
---   Phase 1: Initiate connect with timeout=0 (returns immediately).
---   Phase 2: On subsequent polls, check if the pending connect completed
---            using socket.select with timeout=0.
--- @return boolean success
-local function tcpConnect()
-    local now = socket.gettime()
-
-    -- Phase 2: check if a pending non-blocking connect completed.
-    if AIS.pendingTcp then
-        local _, writable = socket.select({}, {AIS.pendingTcp}, 0)
-        if writable and #writable > 0 then
-            -- Socket became writable — verify connection actually succeeded.
-            local ip = AIS.pendingTcp:getpeername()
-            if ip then
-                AIS.tcp = AIS.pendingTcp
-                AIS.pendingTcp = nil
-                onConnectSuccess()
-                return true
-            else
-                -- Connection failed (refused / reset).
-                pcall(function() AIS.pendingTcp:close() end)
-                AIS.pendingTcp = nil
-                return false
-            end
-        end
-
-        -- Still in progress — give up after 2 seconds to avoid zombie sockets.
-        if now - AIS.lastReconnect > 2 then
-            pcall(function() AIS.pendingTcp:close() end)
-            AIS.pendingTcp = nil
-        end
+--- Send a JSON message (appends newline).
+-- @param tbl table to JSON-encode
+function tcpSend(tbl)
+    if not AIS.connected or not AIS.tcp then
         return false
     end
-
-    -- Phase 1: initiate a new connection attempt (rate-limited).
-    if now - AIS.lastReconnect < AIS.RECONNECT_INTERVAL then
+    local payload = JSON:encode(tbl) .. "\n"
+    local ok, err = AIS.tcp:send(payload)
+    if not ok then
+        logError("TCP send failed: " .. tostring(err))
+        tcpDisconnect()
         return false
     end
-    AIS.lastReconnect = now
-
-    local tcp, err = socket.tcp()
-    if not tcp then
-        logError("Failed to create TCP socket: " .. tostring(err))
-        return false
-    end
-
-    tcp:settimeout(0) -- CRITICAL: non-blocking connect — never stall DCS
-    local ok, cerr = tcp:connect(AIS.TCP_HOST, AIS.TCP_PORT)
-    if ok then
-        -- Instant connect (common on localhost when exe is running).
-        AIS.tcp = tcp
-        onConnectSuccess()
-        return true
-    elseif cerr == "timeout" or cerr == "Operation already in progress"
-           or cerr == "already connected" then
-        -- Connect is in progress — check completion on next poll.
-        AIS.pendingTcp = tcp
-        return false
-    else
-        -- Immediate failure (connection refused, etc.) — zero stall.
-        tcp:close()
-        return false
-    end
+    return true
 end
 
 --- Read available data from the socket, split on newlines, return complete lines.
@@ -248,7 +212,7 @@ local function tcpReadLines()
         if err == "timeout" then
             break
         elseif err == "closed" then
-            logWarning("TCP connection closed by remote")
+            logWarning("TCP connection closed by exe")
             tcpDisconnect()
             break
         elseif err and err ~= "timeout" then
@@ -262,7 +226,7 @@ local function tcpReadLines()
     end
 
     -- Split buffer on newlines using offset to avoid repeated string.sub.
-    -- Cap at 20 lines per poll to prevent JSON decode spikes from backend bursts.
+    -- Cap at 20 lines per poll to prevent JSON decode spikes.
     local MAX_LINES = 20
     while #lines < MAX_LINES do
         local nlPos = string.find(AIS.recvBuffer, "\n", AIS.bufferOffset, true)
@@ -659,9 +623,9 @@ end
 -- ---------------------------------------------------------------------------
 
 local function poll()
-    -- If not connected, attempt reconnect
+    -- If not connected, check for incoming connection (non-blocking).
     if not AIS.connected then
-        tcpConnect()
+        tcpAccept()
         return
     end
 
@@ -780,19 +744,21 @@ function callbacks.onMissionLoadEnd()
         AIS.theatre = "Unknown"
     end
 
-    -- Cleanly disconnect old socket before reconnecting
+    -- Disconnect current client (exe will reconnect).
     tcpDisconnect()
+
+    -- Stop old listener and start fresh (handles port change after redeploy).
+    tcpStopListening()
 
     -- Reset state for new mission
     AIS.trackedGroups = {}
     AIS.unitCounter = 0
     AIS.lastPollTime = 0
-    AIS.lastReconnect = 0
     AIS.cmdQueue = {}
     AIS.helpersInstalled = false
 
-    -- Connect (or reconnect) to backend
-    tcpConnect()
+    -- Start listening for exe connections.
+    tcpListen()
 end
 
 function callbacks.onSimulationStop()
@@ -801,22 +767,26 @@ function callbacks.onSimulationStop()
     -- Destroy all spawned groups
     destroyAllTracked()
 
-    -- Disconnect TCP
+    -- Disconnect client and stop listener
     tcpDisconnect()
+    tcpStopListening()
 
     -- Reset state
     AIS.theatre = nil
     AIS.unitCounter = 0
     AIS.lastPollTime = 0
-    AIS.lastReconnect = 0
     AIS.cmdQueue = {}
     AIS.helpersInstalled = false
 end
 
 -- ---------------------------------------------------------------------------
--- Register callbacks with DCS
+-- Register callbacks with DCS and start listener
 -- ---------------------------------------------------------------------------
 
 logInfo("AIS Traffic Hook loading...")
 DCS.setUserCallbacks(callbacks)
+
+-- Start listening immediately so the exe can connect even before a mission loads.
+tcpListen()
+
 logInfo("AIS Traffic Hook loaded successfully")

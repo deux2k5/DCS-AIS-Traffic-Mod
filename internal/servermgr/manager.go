@@ -1,10 +1,8 @@
 package servermgr
 
 import (
-	"errors"
 	"fmt"
 	"log"
-	"net"
 	"sync"
 	"time"
 
@@ -367,15 +365,10 @@ func (m *Manager) startInstance(srvCfg *config.ServerConfig) error {
 		m.scheduleRefreshAIS()
 	})
 
-	// Start TCP listener.
+	// Start DCS hook connector (dials out to the hook's listener).
 	go func() {
 		if err := dcsServer.Start(); err != nil {
-			var opErr *net.OpError
-			if errors.As(err, &opErr) && opErr.Op == "accept" {
-				log.Printf("[MGR:%s] TCP server stopped", id)
-				return
-			}
-			log.Printf("[MGR:%s] TCP server error: %v", id, err)
+			log.Printf("[MGR:%s] DCS connector error: %v", id, err)
 		}
 	}()
 

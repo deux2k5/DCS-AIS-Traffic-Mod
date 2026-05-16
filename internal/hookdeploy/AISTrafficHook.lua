@@ -22,7 +22,7 @@ local AIS = {}
 AIS.TCP_HOST            = "127.0.0.1"
 AIS.TCP_PORT            = 18420
 AIS.POLL_INTERVAL       = 0.5   -- seconds between TCP reads
-AIS.RECONNECT_INTERVAL  = 5     -- seconds between reconnect attempts
+AIS.RECONNECT_INTERVAL  = 10    -- seconds between reconnect attempts
 AIS.MAX_CMDS_PER_POLL   = 2     -- max expensive commands (spawn/remove/move) per poll
 AIS.MAX_REROUTES_PER_POLL = 4   -- max reroute commands per poll (cheaper than spawn)
 AIS.DEBUG               = false -- set true to enable per-command log lines
@@ -32,6 +32,7 @@ AIS.DEBUG               = false -- set true to enable per-command log lines
 -- ---------------------------------------------------------------------------
 AIS.tcp              = nil      -- TCP socket handle
 AIS.connected        = false
+AIS.pendingTcp       = nil      -- socket during non-blocking connect phase
 AIS.recvBuffer       = ""       -- incomplete data from TCP reads
 AIS.bufferOffset     = 1        -- read position in recvBuffer (avoids O(n^2) sub)
 AIS.lastPollTime     = 0
@@ -73,6 +74,10 @@ local function tcpDisconnect()
         pcall(function() AIS.tcp:close() end)
         AIS.tcp = nil
     end
+    if AIS.pendingTcp then
+        pcall(function() AIS.pendingTcp:close() end)
+        AIS.pendingTcp = nil
+    end
     AIS.connected = false
     AIS.recvBuffer = ""
     AIS.bufferOffset = 1
@@ -101,34 +106,10 @@ local function tcpSendTheatre()
     tcpSend({ type = "theatre", theatre = AIS.theatre })
 end
 
---- Attempt to connect to the Go backend.
--- @return boolean success
-local function tcpConnect()
-    local now = socket.gettime()
-    if now - AIS.lastReconnect < AIS.RECONNECT_INTERVAL then
-        return false
-    end
-    AIS.lastReconnect = now
-
-    logInfo(string.format("Connecting to %s:%d ...", AIS.TCP_HOST, AIS.TCP_PORT))
-
-    local tcp, err = socket.tcp()
-    if not tcp then
-        logError("Failed to create TCP socket: " .. tostring(err))
-        return false
-    end
-
-    tcp:settimeout(0.5) -- short timeout — 2s was too long for frame callbacks
-    local ok, cerr = tcp:connect(AIS.TCP_HOST, AIS.TCP_PORT)
-    if not ok then
-        logError("TCP connect failed: " .. tostring(cerr))
-        tcp:close()
-        return false
-    end
-
-    tcp:settimeout(0) -- non-blocking from here on
-    tcp:setoption("tcp-nodelay", true) -- disable Nagle for lower latency
-    AIS.tcp = tcp
+--- Finalize a new connection: detect theatre, send models to backend.
+local function onConnectSuccess()
+    AIS.tcp:settimeout(0) -- non-blocking for all subsequent I/O
+    AIS.tcp:setoption("tcp-nodelay", true)
     AIS.connected = true
     AIS.recvBuffer = ""
     AIS.bufferOffset = 1
@@ -150,7 +131,6 @@ local function tcpConnect()
     end
 
     -- Detect available ship models so the backend only uses installed ones.
-    -- Batched into a single dostring_in call for efficiency.
     local checkCode = [[
         local models = {
             "container_ship", "fishing_vessel", "trawler_ship", "diesel_trawler",
@@ -180,8 +160,73 @@ local function tcpConnect()
         logInfo(string.format("Detected %d ship models available", #available))
         tcpSend({ type = "models", models = available })
     end
+end
 
-    return true
+--- Attempt to connect to the Go backend (non-blocking).
+-- Uses a two-phase approach to avoid ANY blocking on the DCS frame thread:
+--   Phase 1: Initiate connect with timeout=0 (returns immediately).
+--   Phase 2: On subsequent polls, check if the pending connect completed
+--            using socket.select with timeout=0.
+-- @return boolean success
+local function tcpConnect()
+    local now = socket.gettime()
+
+    -- Phase 2: check if a pending non-blocking connect completed.
+    if AIS.pendingTcp then
+        local _, writable = socket.select({}, {AIS.pendingTcp}, 0)
+        if writable and #writable > 0 then
+            -- Socket became writable — verify connection actually succeeded.
+            local ip = AIS.pendingTcp:getpeername()
+            if ip then
+                AIS.tcp = AIS.pendingTcp
+                AIS.pendingTcp = nil
+                onConnectSuccess()
+                return true
+            else
+                -- Connection failed (refused / reset).
+                pcall(function() AIS.pendingTcp:close() end)
+                AIS.pendingTcp = nil
+                return false
+            end
+        end
+
+        -- Still in progress — give up after 2 seconds to avoid zombie sockets.
+        if now - AIS.lastReconnect > 2 then
+            pcall(function() AIS.pendingTcp:close() end)
+            AIS.pendingTcp = nil
+        end
+        return false
+    end
+
+    -- Phase 1: initiate a new connection attempt (rate-limited).
+    if now - AIS.lastReconnect < AIS.RECONNECT_INTERVAL then
+        return false
+    end
+    AIS.lastReconnect = now
+
+    local tcp, err = socket.tcp()
+    if not tcp then
+        logError("Failed to create TCP socket: " .. tostring(err))
+        return false
+    end
+
+    tcp:settimeout(0) -- CRITICAL: non-blocking connect — never stall DCS
+    local ok, cerr = tcp:connect(AIS.TCP_HOST, AIS.TCP_PORT)
+    if ok then
+        -- Instant connect (common on localhost when exe is running).
+        AIS.tcp = tcp
+        onConnectSuccess()
+        return true
+    elseif cerr == "timeout" or cerr == "Operation already in progress"
+           or cerr == "already connected" then
+        -- Connect is in progress — check completion on next poll.
+        AIS.pendingTcp = tcp
+        return false
+    else
+        -- Immediate failure (connection refused, etc.) — zero stall.
+        tcp:close()
+        return false
+    end
 end
 
 --- Read available data from the socket, split on newlines, return complete lines.
@@ -216,8 +261,10 @@ local function tcpReadLines()
         end
     end
 
-    -- Split buffer on newlines using offset to avoid repeated string.sub
-    while true do
+    -- Split buffer on newlines using offset to avoid repeated string.sub.
+    -- Cap at 20 lines per poll to prevent JSON decode spikes from backend bursts.
+    local MAX_LINES = 20
+    while #lines < MAX_LINES do
         local nlPos = string.find(AIS.recvBuffer, "\n", AIS.bufferOffset, true)
         if not nlPos then
             break
@@ -541,32 +588,36 @@ end
 local function handleClear()
     logInfo("Clearing all tracked AIS groups")
 
-    if installHelpers() then
-        -- Batch destroy in chunks to avoid frame stalls
-        local names = {}
-        for groupName, _ in pairs(AIS.trackedGroups) do
-            names[#names + 1] = groupName
-        end
+    local names = {}
+    for groupName, _ in pairs(AIS.trackedGroups) do
+        names[#names + 1] = groupName
+    end
+    AIS.trackedGroups = {}
+    AIS.cmdQueue = {} -- drop pending commands (they reference cleared ships)
 
-        -- Build a Lua table literal for batch destroy
-        if #names > 0 then
-            local parts = {}
-            for i, name in ipairs(names) do
-                parts[i] = '"' .. string.gsub(name, '["\\\n\r]', '_') .. '"'
-            end
-            local code = 'return AIS_DestroyBatch({' .. table.concat(parts, ',') .. '})'
+    if #names == 0 or not installHelpers() then
+        logInfo("Clear done (0 groups)")
+        return
+    end
+
+    -- Destroy in chunks to avoid frame stalls. First chunk runs now,
+    -- remaining chunks are queued and processed one-per-poll via budget.
+    local CHUNK = 15
+    for i = 1, #names, CHUNK do
+        local parts = {}
+        for j = i, math.min(i + CHUNK - 1, #names) do
+            parts[#parts + 1] = '"' .. string.gsub(names[j], '["\\\n\r]', '_') .. '"'
+        end
+        local code = 'return AIS_DestroyBatch({' .. table.concat(parts, ',') .. '})'
+        if i == 1 then
             local result, err = serverExec(code)
-            if err then
-                logWarning("Batch clear error: " .. err)
-            else
-                logInfo("Batch cleared " .. tostring(result) .. " objects")
-            end
+            if err then logWarning("Clear chunk error: " .. err) end
+        else
+            AIS.cmdQueue[#AIS.cmdQueue + 1] = { cmd = "_batch_destroy", _code = code }
         end
     end
 
-    AIS.trackedGroups = {}
-    AIS.cmdQueue = {}
-    logInfo("All AIS groups cleared")
+    logInfo(string.format("Clearing %d groups in %d chunks", #names, math.ceil(#names / CHUNK)))
 end
 
 --- Dispatch a parsed command table. Returns true if it was an expensive
@@ -592,6 +643,10 @@ local function dispatchCommand(cmd)
     elseif cmd.cmd == "clear" then
         handleClear()
         return false
+    elseif cmd.cmd == "_batch_destroy" then
+        -- Internal: chunked clear continuation.
+        if cmd._code then serverExec(cmd._code) end
+        return true
     else
         logWarning("Unknown command: " .. tostring(cmd.cmd))
         return false
